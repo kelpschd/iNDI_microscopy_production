@@ -45,6 +45,8 @@ plateID_to_folder_ID_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/indi_plat
 plateID_to_folder_ID <- read_csv(plateID_to_folder_ID_fn)
 
 filename <- "/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/Nucleus_feature_data/7e03b502-ad64-4090-a9e2-fc4c3ecdae11_nuclei_features_test_20260317.csv"
+experiment_id <- str_extract(basename(filename), "^[^_]+")
+
 plate <- read_csv(filename) %>%
   mutate(
     Folder_ID = experiment_id,
@@ -54,8 +56,7 @@ plate <- read_csv(filename) %>%
   left_join(plateID_to_folder_ID, by = join_by(Folder_ID)) %>%
   left_join(samplesheet, by = join_by(well_row, well_column, iNDI_Plate_ID))
 
-experiment_id <- str_extract(basename(filename), "^[^_]+")
-plate_ID <- unique(plate$iNDI_Plate_ID)
+plate_ID <- unique(plate$iNDI_Plate_ID)[1]
 ```
 
 ```{r}
@@ -70,6 +71,53 @@ plate %>%
 
 ggplot(plate, aes(x = area, fill = Genotype_Name)) +
   geom_density(alpha = 0.3)
+
+# 384-well plate heatmap of nuclei count
+all_wells <- expand.grid(
+  well_row = 1:16,
+  well_column = 1:24
+)
+
+well_counts <- all_wells %>%
+  left_join(
+    plate %>%
+      group_by(well_row, well_column) %>%
+      summarise(nucleus_count = n(), .groups = "drop"),
+    by = c("well_row", "well_column")
+  ) %>%
+  mutate(nucleus_count = replace_na(nucleus_count, 0)) %>%
+    mutate(nucleus_count = na_if(nucleus_count, 0))
+
+ggplot(well_counts, aes(x = well_column, y = well_row, fill = nucleus_count)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = nucleus_count), size = 2, color = "white", na.rm = TRUE) +
+  scale_x_continuous(
+    breaks = 1:24,
+    expand = c(0, 0),
+    sec.axis = dup_axis(name = NULL)
+  ) +
+  scale_y_reverse(
+    breaks = 1:16,
+    labels = LETTERS[1:16],
+    expand = c(0, 0),
+    sec.axis = dup_axis(labels = 1:16, name = NULL)
+  ) +
+  scale_fill_viridis_c(name = "Nucleus\nCount", option = "magma", na.value = "white") +
+  labs(
+    title = paste0(plate_ID, " — Nuclei per Well"),
+    x = "Column",
+    y = "Row"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(face = "bold", size = 7),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    axis.text.x.top = element_text(face = "bold", size = 7),
+    axis.text.y.right = element_text(face = "bold", size = 7)
+  ) +
+  coord_fixed()
 ```
 
 ```{r}
@@ -95,7 +143,6 @@ plate$UMAP2 <- umap_res[,2]
 ggplot(plate, aes(UMAP1, UMAP2, color = Genotype_Name)) +
   geom_point(alpha = 0.5, size = 0.5) +
   theme_minimal()
-ggsave(filename = paste0(plate_ID, "_UMAP.png"), width = 6, height = 4, path = "./Output/")
 
 ggplot(plate, aes(UMAP1, UMAP2, color = Well_ID)) +
   geom_point(alpha = 0.5, size = 0.5) +
@@ -129,7 +176,6 @@ plate_sub$UMAP2 <- umap_res[,2]
 ggplot(plate_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
   geom_point(alpha = 0.5, size = 0.5) +
   theme_minimal()
-ggsave(filename = paste0(plate_ID, "_subset_UMAP.png"), width = 6, height = 4, path = "./Output/")
 ```
 
 ```{r}
@@ -206,7 +252,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_area.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -238,7 +283,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_mean_intensity.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -270,7 +314,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_std_intensity.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -302,7 +345,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold'))
-ggsave(filename = paste0(plate_ID, "_eccentricity.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -334,7 +376,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_solidity.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -366,7 +407,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_perimeter.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -398,7 +438,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_feret_diameter_max.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -430,7 +469,6 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_major_axis_length.png"), width = 4, height = 6, path = "./Output/")
 
 y_lim <- df_well %>% 
   #filter(Outlier == "Normal") %>%
@@ -462,5 +500,4 @@ ggplot(df_well,
     legend.title = element_text(face = 'bold'),
     legend.text = element_text(face = 'bold'),
     strip.text.x = element_text(face = 'bold')) 
-ggsave(filename = paste0(plate_ID, "_minor_axis_length.png"), width = 4, height = 6, path = "./Output/")
 ```
