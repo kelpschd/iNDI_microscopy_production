@@ -16,8 +16,6 @@ package_list <- c("tidyverse", "uwot", "ranger")
 new_packages <- package_list[!(package_list %in% installed.packages()[,"Package"])]
 if(length(new_packages)) install.packages(new_packages)
 lapply(package_list, library, character.only = TRUE)
-
-dir.create("./Output", showWarnings = FALSE)
 ```
 
 ```{r}
@@ -49,179 +47,6 @@ feature_cols <- c( "area", "mean_intensity", "std_intensity", "eccentricity", "s
 ```{r}
 process_plate <- function(filename) {
   experiment_id <- str_extract(basename(filename), "^[^_]+")
-  
-  plate <- read_csv(filename, show_col_types = FALSE) %>%
-    mutate(
-      Folder_ID = experiment_id,
-      well_row = as.integer(str_extract(image_name, "(?<=r)\\d+")),
-      well_column = as.integer(str_extract(image_name, "(?<=c)\\d+"))
-    ) %>%
-    left_join(plateID_to_folder_ID, by = "Folder_ID") %>%
-    left_join(samplesheet, by = c("well_row", "well_column", "iNDI_Plate_ID"))
-  
-  plate_ID <- unique(plate$iNDI_Plate_ID)[1]
-  message("  → Plate ID: ", plate_ID)
-  
-  plate %>%
-    group_by(Genotype_Name) %>%
-    summarize(
-      nucleus_count = n(),
-      well_count = n_distinct(Well_ID),
-      .groups = "drop"
-    ) %>%
-    write_csv(file = file.path("Output", paste0(plate_ID, "_nuclei_count.csv")))
-  
-  # plate heatmap
-  well_counts <- plate %>%
-    group_by(Well_ID, well_row, well_column) %>%
-    summarise(nucleus_count = n(), .groups = "drop")
-
-  p_heatmap <- ggplot(well_counts, aes(x = well_column, y = well_row, fill = nucleus_count)) +
-    geom_tile(color = "white", linewidth = 0.3) +
-    scale_x_continuous(
-      breaks = 1:24,
-      expand = c(0, 0),
-      sec.axis = dup_axis(name = NULL)
-    ) +
-    scale_y_reverse(
-      breaks = 1:16,
-      labels = LETTERS[1:16],
-      expand = c(0, 0),
-      sec.axis = dup_axis(labels = 1:16, name = NULL)
-    ) +
-    scale_fill_viridis_c(name = "Nucleus\nCount", option = "magma") +
-    labs(
-      title = paste0(plate_ID, " — Nuclei per Well"),
-      x = "Column",
-      y = "Row"
-    ) +
-    theme_bw() +
-    theme(
-      axis.text = element_text(face = "bold", size = 7),
-      axis.title = element_text(face = "bold"),
-      plot.title = element_text(face = "bold"),
-      panel.grid = element_blank(),
-      axis.text.x.top = element_text(face = "bold", size = 7),
-      axis.text.y.right = element_text(face = "bold", size = 7)
-    ) +
-    coord_fixed()
-
-  ggsave(
-    filename = paste0(plate_ID, "_plate_heatmap.png"),
-    plot = p_heatmap,
-    width = 10, height = 6,
-    path = "./Output/"
-  )
-  
-  # original UMAP
-  X <- plate[, feature_cols]
-  plate_scaled <- scale(X)
-  pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
-  X_pca <- pca_result$x[, 1:min(8, ncol(pca_result$x))]
-  umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
-  
-  plate$UMAP1 <- umap_res[, 1]
-  plate$UMAP2 <- umap_res[, 2]
-  
-  p_umap <- ggplot(plate, aes(UMAP1, UMAP2, color = Genotype_Name)) +
-    geom_point(alpha = 0.5, size = 0.5) +
-    theme_minimal()
-  
-  ggsave(
-    filename = paste0(plate_ID, "_UMAP.png"),
-    plot = p_umap,
-    width = 6, height = 4,
-    path = "./Output/"
-  )
-  
-  # subset UMAP
-  plate_sub <- plate %>%
-    select(-any_of(c("UMAP1", "UMAP2"))) %>%
-    group_by(Genotype_Name) %>%
-    group_modify(~ {
-      n_take <- min(500, nrow(.x))
-      slice_sample(.x, n = n_take)
-    }) %>%
-    ungroup()
-  
-  X <- plate_sub[, feature_cols]
-  plate_scaled <- scale(X)
-  pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
-  X_pca <- pca_result$x[, 1:min(8, ncol(pca_result$x))]
-  umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
-  
-  plate_sub$UMAP1 <- umap_res[, 1]
-  plate_sub$UMAP2 <- umap_res[, 2]
-  
-  p_sub_umap <- ggplot(plate_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
-    geom_point(alpha = 0.5, size = 0.5) +
-    theme_minimal()
-  
-  ggsave(
-    filename = paste0(plate_ID, "_subset_UMAP.png"),
-    plot = p_sub_umap,
-    width = 6, height = 4,
-    path = "./Output/"
-  )
-  
-  df_well <- plate %>%
-    group_by(Well_ID, Genotype_Name) %>%
-    summarize(across(all_of(feature_cols), mean, na.rm = TRUE), .groups = "drop")
-  
-  plot_one <- function(df, yvar, ylab, fname, y_step) {
-    y_max <- max(df[[yvar]], na.rm = TRUE)
-    y_lim <- ceiling(y_max / y_step) * y_step
-    
-    p <- ggplot(df, aes(x = Genotype_Name, y = .data[[yvar]])) +
-      geom_violin(fill = "skyblue", alpha = 0.7, scale = "width") +
-      geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.5) +
-      geom_jitter(width = 0.1) +
-      theme_bw() +
-      scale_y_continuous(
-        labels = scales::comma,
-        limits = c(0, y_lim),
-        breaks = seq(0, y_lim, y_lim / 5)
-      ) +
-      labs(x = "Genotype", y = ylab) +
-      theme(
-        axis.text.x = element_text(face = "bold", angle = 45, hjust = 1),
-        axis.title.x = element_text(face = "bold"),
-        axis.text.y = element_text(face = "bold"),
-        axis.title.y = element_text(face = "bold"),
-        legend.title = element_text(face = "bold"),
-        legend.text = element_text(face = "bold"),
-        strip.text.x = element_text(face = "bold")
-      )
-    
-    ggsave(
-      filename = fname,
-      plot = p,
-      width = 4, height = 6,
-      path = "./Output/"
-    )
-  }
-  
-  plot_one(df_well, "area", "Nucleus area (pixels)", paste0(plate_ID, "_area.png"), 5000)
-  plot_one(df_well, "mean_intensity", "Mean Intensity (Well averaged)", paste0(plate_ID, "_mean_intensity.png"), 5000)
-  plot_one(df_well, "std_intensity", "Standard Deviation of Intensity (Well averaged)", paste0(plate_ID, "_std_intensity.png"), 5000)
-  plot_one(df_well, "eccentricity", "Eccentricity (Well averaged)", paste0(plate_ID, "_eccentricity.png"), 1)
-  plot_one(df_well, "solidity", "Solidity (Well averaged)", paste0(plate_ID, "_solidity.png"), 1)
-  plot_one(df_well, "perimeter", "Perimeter (Pixels; well averaged)", paste0(plate_ID, "_perimeter.png"), 100)
-  plot_one(df_well, "feret_diameter_max", "Feret diameter max (Well averaged)", paste0(plate_ID, "_feret_diameter_max.png"), 20)
-  plot_one(df_well, "major_axis_length", "Major axis length (Pixels; well averaged)", paste0(plate_ID, "_major_axis_length.png"), 20)
-  plot_one(df_well, "minor_axis_length", "Minor axis length (Pixels; well averaged)", paste0(plate_ID, "_minor_axis_length.png"), 20)
-  
-  invisible(plate_ID)
-}
-```
-
-```{r}
-plate_ids <- lapply(files, process_plate)
-```
-
-```{r}
-plate_heatmap <- function(filename) {
-  experiment_id <- str_extract(basename(filename), "^[^_]+")
   message("Processing: ", experiment_id)
 
   plate <- read_csv(filename, show_col_types = FALSE) %>%
@@ -236,6 +61,16 @@ plate_heatmap <- function(filename) {
   plate_ID <- unique(plate$iNDI_Plate_ID)[1]
   message("  → Plate ID: ", plate_ID)
 
+  plate %>%
+    group_by(Genotype_Name) %>%
+    summarize(
+      nucleus_count = n(),
+      well_count = n_distinct(Well_ID),
+      .groups = "drop"
+    ) %>%
+    write_csv(file = file.path(outdir, paste0(plate_ID, "_nuclei_count.csv")))
+
+  # plate heatmap
   all_wells <- expand.grid(
     well_row = 1:16,
     well_column = 1:24
@@ -286,11 +121,234 @@ plate_heatmap <- function(filename) {
     filename = paste0(plate_ID, "_plate_heatmap.png"),
     plot = p_heatmap,
     width = 10, height = 6,
-    path = "./Output/"
+    path = paste0("./", outdir, "/")
   )
+
+  # original UMAP
+  X <- plate[, feature_cols]
+  plate_scaled <- scale(X)
+  pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+  X_pca <- pca_result$x[, 1:min(8, ncol(pca_result$x))]
+  umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+  plate$UMAP1 <- umap_res[, 1]
+  plate$UMAP2 <- umap_res[, 2]
+
+  p_umap <- ggplot(plate, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    theme_minimal()
+
+  ggsave(
+    filename = paste0(plate_ID, "_UMAP.png"),
+    plot = p_umap,
+    width = 6, height = 4,
+    path = paste0("./", outdir, "/")
+  )
+
+  # subset UMAP
+  set.seed(1)
+
+  plate_sub <- plate %>%
+    select(-any_of(c("UMAP1", "UMAP2"))) %>%
+    group_by(Genotype_Name) %>%
+    group_modify(~ {
+      n_take <- min(500, nrow(.x))
+      slice_sample(.x, n = n_take)
+    }) %>%
+    ungroup()
+
+  X <- plate_sub[, feature_cols]
+  plate_scaled <- scale(X)
+  pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+  X_pca <- pca_result$x[, 1:min(8, ncol(pca_result$x))]
+  umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+  plate_sub$UMAP1 <- umap_res[, 1]
+  plate_sub$UMAP2 <- umap_res[, 2]
+
+  p_sub_umap <- ggplot(plate_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+    geom_point(alpha = 0.5, size = 0.5) +
+    theme_minimal()
+
+  ggsave(
+    filename = paste0(plate_ID, "_subset_UMAP.png"),
+    plot = p_sub_umap,
+    width = 6, height = 4,
+    path = paste0("./", outdir, "/")
+  )
+
+  df_well <- plate %>%
+    group_by(Well_ID, Genotype_Name) %>%
+    summarize(across(all_of(feature_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+  plot_one <- function(df, yvar, ylab, fname, y_step) {
+    y_max <- max(df[[yvar]], na.rm = TRUE)
+    y_lim <- ceiling(y_max / y_step) * y_step
+
+    p <- ggplot(df, aes(x = Genotype_Name, y = .data[[yvar]])) +
+      geom_violin(fill = "skyblue", alpha = 0.7, scale = "width") +
+      geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.5) +
+      geom_jitter(width = 0.1) +
+      theme_bw() +
+      scale_y_continuous(
+        labels = scales::comma,
+        limits = c(0, y_lim),
+        breaks = seq(0, y_lim, y_step)
+      ) +
+      labs(x = "Genotype", y = ylab) +
+      theme(
+        axis.text.x = element_text(face = "bold", angle = 45, hjust = 1),
+        axis.title.x = element_text(face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.text = element_text(face = "bold"),
+        strip.text.x = element_text(face = "bold")
+      )
+
+    ggsave(
+      filename = fname,
+      plot = p,
+      width = 4, height = 6,
+      path = paste0("./", outdir, "/")
+    )
+  }
+
+  plot_one(df_well, "area",               "Nucleus area (pixels)",                           paste0(plate_ID, "_area.png"),              5000)
+  plot_one(df_well, "mean_intensity",     "Mean Intensity (Well averaged)",                  paste0(plate_ID, "_mean_intensity.png"),     5000)
+  plot_one(df_well, "std_intensity",      "Standard Deviation of Intensity (Well averaged)", paste0(plate_ID, "_std_intensity.png"),      5000)
+  plot_one(df_well, "eccentricity",       "Eccentricity (Well averaged)",                    paste0(plate_ID, "_eccentricity.png"),       0.2)
+  plot_one(df_well, "solidity",           "Solidity (Well averaged)",                        paste0(plate_ID, "_solidity.png"),           0.2)
+  plot_one(df_well, "perimeter",          "Perimeter (Pixels; well averaged)",               paste0(plate_ID, "_perimeter.png"),          100)
+  plot_one(df_well, "feret_diameter_max", "Feret diameter max (Well averaged)",              paste0(plate_ID, "_feret_diameter_max.png"), 20)
+  plot_one(df_well, "major_axis_length",  "Major axis length (Pixels; well averaged)",       paste0(plate_ID, "_major_axis_length.png"),  20)
+  plot_one(df_well, "minor_axis_length",  "Minor axis length (Pixels; well averaged)",       paste0(plate_ID, "_minor_axis_length.png"),  20)
+
+  # Representative nuclei for nuclear area (closest to per-genotype mean)
+  representative_nuclei <- plate %>%
+    group_by(Genotype_Name) %>%
+    mutate(
+      mean_area = mean(area, na.rm = TRUE),
+      diff_from_mean = abs(area - mean_area)
+    ) %>%
+    slice_min(order_by = diff_from_mean, n = 10) %>%
+    select(-c(mean_area, diff_from_mean)) %>%
+    ungroup()
+
+  write_csv(representative_nuclei, file = file.path(outdir, paste0(plate_ID, "_representative_nuclei.csv")))
 
   invisible(plate_ID)
 }
-
-lapply(files, plate_heatmap)
 ```
+
+```{r}
+outdir = "Output_raw_run1"
+dir.create(paste0("./", outdir), showWarnings = FALSE)
+plate_ids <- lapply(files, process_plate)
+```
+
+# Filter data
+
+```{r}
+# ── Filter 1: Size ────────────────────────────────────────────────────────────
+filter_size <- function(plate, min_um2 = 20, max_um2 = 200) {
+  plate %>%
+    mutate(area_um2 = area * px_factor^2) %>%
+    filter(area_um2 > min_um2, area_um2 < max_um2)
+}
+
+# ── Filter 2: Edge touch ──────────────────────────────────────────────────────
+# Removes any nucleus whose bounding circle (radius = 120 px) touches any edge.
+# Requires image dimensions — assumes all images in a plate are the same size.
+# img_h and img_w should be the image height and width in pixels.
+filter_edge <- function(plate, radius = 120, img_h, img_w) {
+  plate %>%
+    filter(
+      `centroid-0` - radius >= 0,
+      `centroid-0` + radius <= img_h,
+      `centroid-1` - radius >= 0,
+      `centroid-1` + radius <= img_w
+    )
+}
+
+# ── Filter 3: Circle overlap ──────────────────────────────────────────────────
+# For each nucleus, checks whether any other nucleus centroid falls close enough
+# that the two circles overlap by more than 5% of the circle area.
+#
+# Two circles of radius r overlap when the distance between centres < 2r.
+# The overlapping area of two circles of equal radius r separated by distance d is:
+#   A_overlap = 2r^2 * acos(d / (2r)) - (d/2) * sqrt(4r^2 - d^2)
+# We remove a nucleus if any neighbour produces overlap > 0.05 * pi * r^2.
+
+filter_overlap <- function(plate, radius = 120, max_overlap_frac = 0.05) {
+  circle_area   <- pi * radius^2
+  max_overlap   <- max_overlap_frac * circle_area
+
+  cx <- plate$`centroid-1`
+  cy <- plate$`centroid-0`
+  n  <- nrow(plate)
+
+  keep <- logical(n)
+
+  for (i in seq_len(n)) {
+    dx <- cx - cx[i]
+    dy <- cy - cy[i]
+    d  <- sqrt(dx^2 + dy^2)
+
+    # Only consider other nuclei within striking distance
+    neighbours <- which(d > 0 & d < 2 * radius)
+
+    if (length(neighbours) == 0) {
+      keep[i] <- TRUE
+      next
+    }
+
+    overlaps <- sapply(neighbours, function(j) {
+      dij <- d[j]
+      2 * radius^2 * acos(dij / (2 * radius)) - (dij / 2) * sqrt(4 * radius^2 - dij^2)
+    })
+
+    keep[i] <- all(overlaps <= max_overlap)
+  }
+
+  plate[keep, ]
+}
+
+# ── Apply all filters ─────────────────────────────────────────────────────────
+apply_filters <- function(plate, img_h, img_w,
+                           min_um2 = 20, max_um2 = 200,
+                           radius = 120, max_overlap_frac = 0.05) {
+  n_start <- nrow(plate)
+
+  plate <- filter_size(plate, min_um2, max_um2)
+  n_after_size <- nrow(plate)
+
+  plate <- filter_edge(plate, radius, img_h, img_w)
+  n_after_edge <- nrow(plate)
+
+  plate <- filter_overlap(plate, radius, max_overlap_frac)
+  n_after_overlap <- nrow(plate)
+
+  message(glue::glue(
+    "  Filtering summary:
+       Start:            {n_start}
+       After size:       {n_after_size} (-{n_start - n_after_size})
+       After edge:       {n_after_edge} (-{n_after_size - n_after_edge})
+       After overlap:    {n_after_overlap} (-{n_after_edge - n_after_overlap})"
+  ))
+
+  plate
+}
+
+outdir = "Output_filtered_run1"
+dir.create(paste0("./", outdir), showWarnings = FALSE)
+plate_ids <- lapply(files, process_plate)
+```
+
+filtering
+
+Area must be greater than 20 µm2 and smaller than 200 µm2
+
+circle around each nuc with 120 px radius
+
+less than 5% overlap with another nucleus and remove if touching img border

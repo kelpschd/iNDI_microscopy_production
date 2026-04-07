@@ -4,3 +4,5 @@
 .Ruserdata
 .vscode
 Nucleus_segmentation/analysis/Output/
+Nucleus_segmentation/analysis/Output_run1/
+Nucleus_segmentation/analysis/Output_raw_run1/
