@@ -44,7 +44,6 @@ files <- list.files( path = "/vf/users/kelpschdj/iNDI/Production/Nucleus_segment
 
 ```{r}
 feature_cols <- c( "area", "mean_intensity", "std_intensity", "eccentricity", "solidity", "perimeter", "feret_diameter_max", "major_axis_length", "minor_axis_length" )
-
 px_factor <- 0.09418670872212731
 radius    <- 120
 img_size  <- 2160
@@ -98,25 +97,39 @@ flag_overlap_img <- function(df, radius = 120, max_overlap_frac = 0.05) {
   df
 }
 
+flag_intensity <- function(plate, min_intensity = 500) {
+  plate %>%
+    mutate(fail_intensity = max_intensity <= min_intensity)
+}
+
+flag_perimeter <- function(plate, max_perimeter = 1000) {
+  plate %>%
+    mutate(fail_perimeter = perimeter >= max_perimeter)
+}
+
 apply_filters <- function(plate) {
   plate <- flag_size(plate)
   plate <- flag_edge(plate)
+  plate <- flag_intensity(plate)
+  plate <- flag_perimeter(plate)
   plate <- plate %>%
     group_by(image_name) %>%
     group_modify(~ flag_overlap_img(.x, radius = radius)) %>%
     ungroup() %>%
-    mutate(pass_qc = !fail_size & !fail_edge & !fail_overlap)
+    mutate(pass_qc = !fail_size & !fail_edge & !fail_intensity & !fail_perimeter & !fail_overlap)
 
   n_total <- nrow(plate)
   n_pass  <- sum(plate$pass_qc)
 
   message(glue(
     "  Filtering summary:\n",
-    "    Total:        {n_total}\n",
-    "    Fail size:    {sum(plate$fail_size)}\n",
-    "    Fail edge:    {sum(plate$fail_edge)}\n",
-    "    Fail overlap: {sum(plate$fail_overlap)}\n",
-    "    Pass QC:      {n_pass} ({round(n_pass / n_total * 100, 1)}%)"
+    "    Total:          {n_total}\n",
+    "    Fail size:      {sum(plate$fail_size)}\n",
+    "    Fail edge:      {sum(plate$fail_edge)}\n",
+    "    Fail intensity: {sum(plate$fail_intensity)}\n",
+    "    Fail perimeter: {sum(plate$fail_perimeter)}\n",
+    "    Fail overlap:   {sum(plate$fail_overlap)}\n",
+    "    Pass QC:        {n_pass} ({round(n_pass / n_total * 100, 1)}%)"
   ))
 
   plate
@@ -267,9 +280,11 @@ process_plate <- function(filename) {
       group_by(Well_ID, Genotype_Name) %>%
       summarize(across(all_of(feature_cols), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
 
-    plot_one <- function(df, yvar, ylab, fname, y_step) {
-      y_max <- max(df[[yvar]], na.rm = TRUE)
-      y_lim <- ceiling(y_max / y_step) * y_step
+    plot_one <- function(df, yvar, ylab, fname, round_to) {
+      y_lim <- df %>%
+        pull({{ yvar }}) %>%
+        max(., na.rm = TRUE) %>%
+        plyr::round_any(., round_to, ceiling)
 
       p <- ggplot(df, aes(x = Genotype_Name, y = .data[[yvar]])) +
         geom_violin(fill = "skyblue", alpha = 0.7, scale = "width") +
@@ -279,7 +294,7 @@ process_plate <- function(filename) {
         scale_y_continuous(
           labels = scales::comma,
           limits = c(0, y_lim),
-          breaks = seq(0, y_lim, y_step)
+          breaks = seq(0, y_lim, y_lim / 5)
         ) +
         labs(x = "Genotype", y = ylab) +
         theme(
@@ -332,7 +347,7 @@ process_plate <- function(filename) {
 ```
 
 ```{r}
-outdir = "Output_run1"
+outdir <- "Output_run1"
 dir.create(paste0("./", outdir), showWarnings = FALSE)
 plate_ids <- lapply(files, process_plate)
 ```

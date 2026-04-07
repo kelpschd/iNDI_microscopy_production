@@ -42,7 +42,7 @@ samplesheet <- samplesheet_auto %>%
 plateID_to_folder_ID_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/indi_plateID_to_folderID.csv"
 plateID_to_folder_ID <- read_csv(plateID_to_folder_ID_fn)
 
-filename <- "/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/Nucleus_feature_data/7e03b502-ad64-4090-a9e2-fc4c3ecdae11_nuclei_features_test_20260317.csv"
+filename <- "/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/Nucleus_feature_data/c8f2dbbe-6632-4063-ab68-0b4fa37909af_nuclei_features_test_20260318.csv"
 experiment_id <- str_extract(basename(filename), "^[^_]+")
 
 plate <- read_csv(filename) %>%
@@ -119,6 +119,44 @@ filtered_plate <- filtered_plate %>%
   ungroup()
 
 print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by overlap"))
+
+filtered_plate <- filtered_plate %>%
+  filter(max_intensity > 500)
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering max intensity cutoff"))
+
+filtered_plate <- filtered_plate %>%
+  filter(perimeter < 1000)
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by perimeter"))
+```
+
+```{r}
+ggplot(plate,
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(plate %>% filter(mean_intensity<10000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate,
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate %>% filter(mean_intensity<10000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate %>% filter(mean_intensity<10000, max_intensity>1000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+```
+
+```{r}
+filtered_plate %>% 
+  filter(perimeter < 1000, Genotype_Name == "PSEN1 E276A HOM") %>%
+  write_csv("test.csv")
 ```
 
 ```{r}
