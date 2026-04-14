@@ -97,9 +97,9 @@ flag_overlap_img <- function(df, radius = 120, max_overlap_frac = 0.05) {
   df
 }
 
-flag_intensity <- function(plate, min_intensity = 500) {
+flag_intensity <- function(plate, max_intensity_cutoff = 500) {
   plate %>%
-    mutate(fail_intensity = max_intensity <= min_intensity)
+    mutate(fail_intensity = max_intensity <= max_intensity_cutoff)
 }
 
 flag_perimeter <- function(plate, max_perimeter = 1000) {
