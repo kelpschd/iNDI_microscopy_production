@@ -1,0 +1,556 @@
+---
+title: "prod_nuc_analysis_AllParentals_20260414"
+format: html
+editor: visual
+---
+
+```{r}
+setwd("/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/analysis")
+```
+
+```{r}
+#| include: false
+#| label: Load packages
+
+package_list <- c("tidyverse", "uwot", "ranger", "glue")
+new_packages <- package_list[!(package_list %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+lapply(package_list, library, character.only = TRUE)
+```
+
+```{r}
+#| label: Prepare data
+
+samplesheet_auto_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/all_automated_plates_combined.csv"
+samplesheet_auto <- read_csv(samplesheet_auto_fn) %>%
+  mutate(
+    well_row = match(str_extract(Well_ID, "^[A-Z]"), LETTERS),
+    well_column = as.integer(str_extract(Well_ID, "\\d+")),
+    experiment_design = "Automated"
+  )
+
+samplesheet_man_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/all_manual_plates_combined.csv"
+samplesheet_man <- read_csv(samplesheet_man_fn) %>%
+  mutate(
+    well_row = match(str_extract(Well_ID, "^[A-Z]"), LETTERS),
+    well_column = as.integer(str_extract(Well_ID, "\\d+")),
+    experiment_design = "Manual"
+  )
+
+samplesheet <- bind_rows(samplesheet_auto, samplesheet_man)
+
+plateID_to_folder_ID_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/indi_plateID_to_folderID.csv" 
+plateID_to_folder_ID <- read_csv(plateID_to_folder_ID_fn) 
+files <- list.files( path = "/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/Nucleus_feature_data/", pattern = "\\.csv$", full.names = TRUE ) 
+```
+
+```{r}
+feature_cols <- c( "area", "mean_intensity", "std_intensity", "eccentricity", "solidity", "perimeter", "feret_diameter_max", "major_axis_length", "minor_axis_length" )
+px_factor <- 0.09418670872212731
+radius    <- 120
+img_size  <- 2160
+```
+
+```{r}
+flag_size <- function(plate, min_um2 = 20, max_um2 = 200) {
+  plate %>%
+    mutate(
+      area_um2  = area * px_factor^2,
+      fail_size = area_um2 <= min_um2 | area_um2 >= max_um2
+    )
+}
+
+flag_edge <- function(plate, radius = 120, img_h = img_size, img_w = img_size) {
+  plate %>%
+    mutate(
+      fail_edge = `centroid-0` - radius < 0  |
+                  `centroid-0` + radius > img_h |
+                  `centroid-1` - radius < 0  |
+                  `centroid-1` + radius > img_w
+    )
+}
+
+flag_overlap_img <- function(df, radius = 120, max_overlap_frac = 0.05) {
+  circle_area <- pi * radius^2
+  max_overlap <- max_overlap_frac * circle_area
+
+  cx   <- df$`centroid-1`
+  cy   <- df$`centroid-0`
+  n    <- nrow(df)
+  fail <- logical(n)
+
+  for (i in seq_len(n)) {
+    dx          <- cx - cx[i]
+    dy          <- cy - cy[i]
+    d           <- sqrt(dx^2 + dy^2)
+    neighbours  <- which(d > 0 & d < 2 * radius)
+
+    if (length(neighbours) == 0) next
+
+    overlaps <- sapply(neighbours, function(j) {
+      dij <- d[j]
+      2 * radius^2 * acos(dij / (2 * radius)) - (dij / 2) * sqrt(4 * radius^2 - dij^2)
+    })
+
+    if (any(overlaps > max_overlap)) fail[i] <- TRUE
+  }
+
+  df$fail_overlap <- fail
+  df
+}
+
+flag_intensity <- function(plate, max_intensity_cutoff = 500) {
+  plate %>%
+    mutate(fail_intensity = max_intensity <= max_intensity_cutoff)
+}
+
+flag_perimeter <- function(plate, max_perimeter = 1000) {
+  plate %>%
+    mutate(fail_perimeter = perimeter >= max_perimeter)
+}
+
+apply_filters <- function(plate) {
+  plate <- flag_size(plate)
+  plate <- flag_edge(plate)
+  plate <- flag_intensity(plate)
+  plate <- flag_perimeter(plate)
+  plate <- plate %>%
+    group_by(image_name) %>%
+    group_modify(~ flag_overlap_img(.x, radius = radius)) %>%
+    ungroup() %>%
+    mutate(pass_qc = !fail_size & !fail_edge & !fail_intensity & !fail_perimeter & !fail_overlap)
+
+  n_total <- nrow(plate)
+  n_pass  <- sum(plate$pass_qc)
+
+  message(glue(
+    "  Filtering summary:\n",
+    "    Total:          {n_total}\n",
+    "    Fail size:      {sum(plate$fail_size)}\n",
+    "    Fail edge:      {sum(plate$fail_edge)}\n",
+    "    Fail intensity: {sum(plate$fail_intensity)}\n",
+    "    Fail perimeter: {sum(plate$fail_perimeter)}\n",
+    "    Fail overlap:   {sum(plate$fail_overlap)}\n",
+    "    Pass QC:        {n_pass} ({round(n_pass / n_total * 100, 1)}%)"
+  ))
+
+  plate
+}
+```
+
+```{r}
+process_plate <- function(filename) {
+  experiment_id <- str_extract(basename(filename), "^[^_]+")
+  message("Processing: ", experiment_id)
+
+  plate <- read_csv(filename, show_col_types = FALSE) %>%
+    mutate(
+      Folder_ID   = experiment_id,
+      well_row    = as.integer(str_extract(image_name, "(?<=r)\\d+")),
+      well_column = as.integer(str_extract(image_name, "(?<=c)\\d+"))
+    ) %>%
+    left_join(plateID_to_folder_ID, by = "Folder_ID") %>%
+    left_join(samplesheet, by = c("well_row", "well_column", "iNDI_Plate_ID"))
+
+  plate_ID <- unique(plate$iNDI_Plate_ID)[1]
+  message("  → Plate ID: ", plate_ID)
+
+  # Apply filters
+  plate <- apply_filters(plate)
+  
+  plate %>% 
+    filter(pass_qc) %>%
+    filter(Genotype_Name == "Parental")
+}
+```
+
+```{r}
+safe_process <- purrr::possibly(process_plate, otherwise = NULL)
+all_parentals <- purrr::map(files, safe_process, .progress = TRUE) %>%
+  purrr::compact() %>%
+  list_rbind()
+```
+
+```{r}
+X <- all_parentals[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+pca_var <- pca_result$sdev^2
+pct_var <- pca_var / sum(pca_var) * 100
+
+# Scree plot
+tibble(PC = 1:length(pct_var), var = pct_var) %>%
+  ggplot(aes(PC, var)) +
+  geom_col() +
+  labs(y = "% Variance Explained") +
+  theme_minimal()
+
+# PC1 vs PC2
+pca_df <- as_tibble(pca_result$x) %>%
+  bind_cols(all_parentals)
+
+ggplot(pca_df, aes(PC1, PC2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  labs(
+    x = glue("PC1 ({round(pct_var[1], 1)}%)"),
+    y = glue("PC2 ({round(pct_var[2], 1)}%)")
+  ) +
+  theme_minimal()
+
+ggplot(pca_df, aes(PC1, PC2, color = Well_ID)) +
+  geom_point(alpha = 0.5, size = 0.5, show.legend = FALSE) +
+  labs(
+    x = glue("PC1 ({round(pct_var[1], 1)}%)"),
+    y = glue("PC2 ({round(pct_var[2], 1)}%)")
+  ) +
+  theme_minimal()
+
+ggplot(pca_df, aes(PC1, PC2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  labs(
+    x = glue("PC1 ({round(pct_var[1], 1)}%)"),
+    y = glue("PC2 ({round(pct_var[2], 1)}%)")
+  ) +
+  theme_minimal()
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+all_parentals$UMAP1 <- umap_res[,1]
+all_parentals$UMAP2 <- umap_res[,2]
+
+ggplot(all_parentals, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+ggplot(all_parentals, aes(UMAP1, UMAP2, color = Well_ID)) +
+  geom_point(alpha = 0.5, size = 0.5, show.legend = FALSE) +
+  theme_minimal()
+
+ggplot(all_parentals, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+#subsample umap
+set.seed(1)
+
+plate_sub <- all_parentals %>%
+  select(-c("UMAP1", "UMAP2")) %>%
+  group_by(iNDI_Plate_ID) %>%
+  slice_sample(n = 500) %>%
+  ungroup()
+
+X <- plate_sub[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+plate_sub$UMAP1 <- umap_res[,1]
+plate_sub$UMAP2 <- umap_res[,2]
+
+ggplot(plate_sub, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+ggplot(plate_sub, aes(UMAP1, UMAP2, color = Well_ID)) +
+  geom_point(alpha = 0.5, size = 0.5, show.legend = FALSE) +
+  theme_minimal()
+
+ggplot(plate_sub, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+```
+
+```{r}
+df_well <- all_parentals %>%
+  group_by(Well_ID, iNDI_Plate_ID, Batch_Info, experiment_design) %>%
+  summarise(across(all_of(feature_cols), mean), .groups = "drop") 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = area)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Nucleus area (pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = mean_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Mean Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(std_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = std_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Standard Deviation of Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(eccentricity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = eccentricity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Eccentricity(Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold'))
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(solidity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = solidity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Solidity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(perimeter) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 100, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = perimeter)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Perimeter (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(feret_diameter_max) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = feret_diameter_max)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "feret diameter max (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(major_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = major_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Major axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(minor_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = iNDI_Plate_ID, 
+           y = minor_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Minor axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+```

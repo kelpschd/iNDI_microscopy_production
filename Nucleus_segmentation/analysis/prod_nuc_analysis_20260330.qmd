@@ -1,0 +1,996 @@
+---
+title: "test"
+author: "test"
+format: html
+editor: visual
+---
+
+```{r}
+setwd("/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/analysis")
+```
+
+```{r}
+#| include: false
+#| label: Load packages
+
+package_list <- c("tidyverse", "uwot", "ranger")
+new_packages <- package_list[!(package_list %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+lapply(package_list, library, character.only = TRUE)
+```
+
+```{r}
+#| label: Prepare data
+
+samplesheet_auto_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/all_automated_plates_combined.csv"
+samplesheet_auto <- read_csv(samplesheet_auto_fn) %>%
+  mutate(
+    well_row = match(str_extract(Well_ID, "^[A-Z]"), LETTERS),
+    well_column = as.integer(str_extract(Well_ID, "\\d+"))
+  )
+
+samplesheet_man_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/all_manual_plates_combined.csv"
+samplesheet_man <- read_csv(samplesheet_man_fn) %>%
+  mutate(
+    well_row = match(str_extract(Well_ID, "^[A-Z]"), LETTERS),
+    well_column = as.integer(str_extract(Well_ID, "\\d+"))
+  )
+
+samplesheet <- samplesheet_auto %>% 
+  add_row(samplesheet_man)
+
+plateID_to_folder_ID_fn <- "/vf/users/CARDPB2/iNDI/Production/metadata/indi_plateID_to_folderID.csv"
+plateID_to_folder_ID <- read_csv(plateID_to_folder_ID_fn)
+
+filename <- "/vf/users/kelpschdj/iNDI/Production/Nucleus_segmentation/Nucleus_feature_data/c8f2dbbe-6632-4063-ab68-0b4fa37909af_nuclei_features_test_20260318.csv"
+experiment_id <- str_extract(basename(filename), "^[^_]+")
+
+plate <- read_csv(filename) %>%
+  mutate(
+    Folder_ID = experiment_id,
+    well_row = as.integer(str_extract(`image_name`, "(?<=r)\\d+")),
+    well_column = as.integer(str_extract(`image_name`, "(?<=c)\\d+"))
+    ) %>%
+  left_join(plateID_to_folder_ID, by = join_by(Folder_ID)) %>%
+  left_join(samplesheet, by = join_by(well_row, well_column, iNDI_Plate_ID))
+
+plate_ID <- unique(plate$iNDI_Plate_ID)[1]
+```
+
+```{r}
+# filter nuclei
+px_factor = 0.09418670872212731
+radius = 120
+
+print(paste0("There are ", nrow(plate), " nuclei"))
+
+filtered_plate <- plate %>% 
+  mutate(area_um2 = area * px_factor^2) %>%
+  filter(area_um2 > 20, area_um2 < 200)
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by nucleus size"))
+
+filtered_plate <- filtered_plate %>%
+    filter(
+      `centroid-0` - radius >= 0,
+      `centroid-0` + radius <= 2160,
+      `centroid-1` - radius >= 0,
+      `centroid-1` + radius <= 2160
+    ) 
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by edge touching"))
+
+filter_overlap <- function(df, radius = 120, max_overlap_frac = 0.05) {
+  circle_area <- pi * radius^2
+  max_overlap <- max_overlap_frac * circle_area
+  
+  cx <- df$`centroid-1`
+  cy <- df$`centroid-0`
+  n  <- nrow(df)
+  
+  keep <- logical(n)
+  
+  for (i in seq_len(n)) {
+    dx <- cx - cx[i]
+    dy <- cy - cy[i]
+    d  <- sqrt(dx^2 + dy^2)
+    
+    neighbours <- which(d > 0 & d < 2 * radius)
+    
+    if (length(neighbours) == 0) {
+      keep[i] <- TRUE
+      next
+    }
+    
+    overlaps <- sapply(neighbours, function(j) {
+      dij <- d[j]
+      2 * radius^2 * acos(dij / (2 * radius)) - (dij / 2) * sqrt(4 * radius^2 - dij^2)
+    })
+    
+    keep[i] <- all(overlaps <= max_overlap)
+  }
+  
+  df[keep, ]
+}
+
+filtered_plate <- filtered_plate %>%
+  group_by(image_name) %>%
+  group_modify(~ filter_overlap(.x, radius = radius)) %>%
+  ungroup()
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by overlap"))
+
+filtered_plate <- filtered_plate %>%
+  filter(max_intensity > 500)
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering max intensity cutoff"))
+
+filtered_plate <- filtered_plate %>%
+  filter(perimeter < 1000)
+
+print(paste0("There are ", nrow(filtered_plate), " nuclei after filtering by perimeter"))
+```
+
+```{r}
+ggplot(plate,
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(plate %>% filter(mean_intensity<10000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate,
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate %>% filter(mean_intensity<10000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate %>% filter(mean_intensity<10000, max_intensity>1000), 
+       aes(x = mean_intensity, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+```
+
+```{r}
+filtered_plate %>% 
+  filter(perimeter < 1000, Genotype_Name == "PSEN1 E276A HOM") %>%
+  write_csv("test.csv")
+```
+
+```{r}
+# nuclei counts per genotype
+plate %>% 
+  group_by(Genotype_Name) %>%
+  summarize(
+    nucleus_count = n(), 
+    well_count = n_distinct(Well_ID)
+    ) 
+
+filtered_plate %>% 
+  group_by(Genotype_Name) %>%
+  summarize(
+    nucleus_count = n(), 
+    well_count = n_distinct(Well_ID)
+    ) 
+
+ggplot(plate, aes(x = area, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+ggplot(filtered_plate, aes(x = area, fill = Genotype_Name)) +
+  geom_density(alpha = 0.3)
+
+# 384-well plate heatmap of nuclei count
+all_wells <- expand.grid(
+  well_row = 1:16,
+  well_column = 1:24
+)
+
+well_counts <- all_wells %>%
+  left_join(
+    plate %>%
+      group_by(well_row, well_column) %>%
+      summarise(nucleus_count = n(), .groups = "drop"),
+    by = c("well_row", "well_column")
+  ) %>%
+  mutate(nucleus_count = replace_na(nucleus_count, 0)) %>%
+    mutate(nucleus_count = na_if(nucleus_count, 0))
+
+ggplot(well_counts, aes(x = well_column, y = well_row, fill = nucleus_count)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = nucleus_count), size = 2, color = "white", na.rm = TRUE) +
+  scale_x_continuous(
+    breaks = 1:24,
+    expand = c(0, 0),
+    sec.axis = dup_axis(name = NULL)
+  ) +
+  scale_y_reverse(
+    breaks = 1:16,
+    labels = LETTERS[1:16],
+    expand = c(0, 0),
+    sec.axis = dup_axis(labels = 1:16, name = NULL)
+  ) +
+  scale_fill_viridis_c(name = "Nucleus\nCount", option = "magma", na.value = "white") +
+  labs(
+    title = paste0(plate_ID, " — Nuclei per Well"),
+    x = "Column",
+    y = "Row"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(face = "bold", size = 7),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    axis.text.x.top = element_text(face = "bold", size = 7),
+    axis.text.y.right = element_text(face = "bold", size = 7)
+  ) +
+  coord_fixed()
+
+well_counts <- all_wells %>%
+  left_join(
+    filtered_plate %>%
+      group_by(well_row, well_column) %>%
+      summarise(nucleus_count = n(), .groups = "drop"),
+    by = c("well_row", "well_column")
+  ) %>%
+  mutate(nucleus_count = replace_na(nucleus_count, 0)) %>%
+    mutate(nucleus_count = na_if(nucleus_count, 0))
+
+ggplot(well_counts, aes(x = well_column, y = well_row, fill = nucleus_count)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = nucleus_count), size = 2, color = "white", na.rm = TRUE) +
+  scale_x_continuous(
+    breaks = 1:24,
+    expand = c(0, 0),
+    sec.axis = dup_axis(name = NULL)
+  ) +
+  scale_y_reverse(
+    breaks = 1:16,
+    labels = LETTERS[1:16],
+    expand = c(0, 0),
+    sec.axis = dup_axis(labels = 1:16, name = NULL)
+  ) +
+  scale_fill_viridis_c(name = "Nucleus\nCount", option = "magma", na.value = "white") +
+  labs(
+    title = paste0(plate_ID, " — Nuclei per Well"),
+    x = "Column",
+    y = "Row"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(face = "bold", size = 7),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    axis.text.x.top = element_text(face = "bold", size = 7),
+    axis.text.y.right = element_text(face = "bold", size = 7)
+  ) +
+  coord_fixed()
+```
+
+```{r}
+feature_cols <- c("area", "mean_intensity", "std_intensity", "eccentricity", "solidity", "perimeter", "feret_diameter_max", "major_axis_length", "minor_axis_length")
+
+X <- plate[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+plate$UMAP1 <- umap_res[,1]
+plate$UMAP2 <- umap_res[,2]
+
+ggplot(plate, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+ggplot(plate, aes(UMAP1, UMAP2, color = Well_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+#subsample umap
+set.seed(1)
+
+plate_sub <- plate %>%
+  select(-c("UMAP1", "UMAP2")) %>%
+  group_by(Genotype_Name) %>%
+  slice_sample(n = 500) %>%
+  ungroup()
+
+X <- plate_sub[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+plate_sub$UMAP1 <- umap_res[,1]
+plate_sub$UMAP2 <- umap_res[,2]
+
+ggplot(plate_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+# plate$Genotype_Name <- factor(plate$Genotype_Name)
+# 
+# model <- ranger(
+#   Genotype_Name ~ .,
+#   data = plate[, c(feature_cols, "Genotype_Name")],
+#   num.trees = 500,
+#   num.threads = as.numeric(Sys.getenv("SLURM_CPUS_PER_TASK")),
+#   importance = "impurity"
+# )
+# 
+# model
+# importance(model)
+# 
+# plate$is_parental <- plate$Genotype_Name == "Parental"
+# 
+# model_bin <- ranger(
+#   is_parental ~ ., 
+#   data = plate[, c(feature_cols, "is_parental")],
+#   num.trees = 500,
+#   num.threads = as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1")),
+#   importance = "impurity"
+# )
+# 
+# model_bin
+# importance(model_bin)
+```
+
+```{r}
+feature_cols <- c("area", "mean_intensity", "std_intensity", "eccentricity", "solidity", "perimeter", "feret_diameter_max", "major_axis_length", "minor_axis_length")
+
+X <- filtered_plate[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+filtered_plate$UMAP1 <- umap_res[,1]
+filtered_plate$UMAP2 <- umap_res[,2]
+
+ggplot(filtered_plate, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+ggplot(filtered_plate, aes(UMAP1, UMAP2, color = Well_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+#subsample umap
+set.seed(1)
+
+plate_sub <- filtered_plate %>%
+  select(-c("UMAP1", "UMAP2")) %>%
+  group_by(Genotype_Name) %>%
+  slice_sample(n = 500) %>%
+  ungroup()
+
+X <- plate_sub[, feature_cols]
+plate_scaled <- scale(X)
+
+cor_mat <- cor(plate_scaled, use = "complete.obs")
+
+pca_result <- prcomp(plate_scaled, center = FALSE, scale. = FALSE)
+X_pca <- pca_result$x[, 1:8]
+
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+plate_sub$UMAP1 <- umap_res[,1]
+plate_sub$UMAP2 <- umap_res[,2]
+
+ggplot(plate_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal()
+
+# filtered_plate$Genotype_Name <- factor(filtered_plate$Genotype_Name)
+# 
+# model <- ranger(
+#   Genotype_Name ~ .,
+#   data = filtered_plate[, c(feature_cols, "Genotype_Name")],
+#   num.trees = 500,
+#   num.threads = as.numeric(Sys.getenv("SLURM_CPUS_PER_TASK")),
+#   importance = "impurity"
+# )
+# 
+# model
+# importance(model)
+# 
+# filtered_plate$is_parental <- filtered_plate$Genotype_Name == "Parental"
+# 
+# model_bin <- ranger(
+#   is_parental ~ ., 
+#   data = filtered_plate[, c(feature_cols, "is_parental")],
+#   num.trees = 500,
+#   num.threads = as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1")),
+#   importance = "impurity"
+# )
+# 
+# model_bin
+# importance(model_bin)
+```
+
+```{r}
+df_well <- plate %>%
+  group_by(Well_ID, Genotype_Name) %>%
+  summarise(across(all_of(feature_cols), mean), .groups = "drop") 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = area)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Nucleus area (pixels)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = mean_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Mean Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(std_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = std_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Standard Deviation of Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(eccentricity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = eccentricity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Eccentricity(Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold'))
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(solidity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = solidity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Solidity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(perimeter) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 100, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = perimeter)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Perimeter (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(feret_diameter_max) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = feret_diameter_max)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "feret diameter max (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(major_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = major_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Major axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(minor_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = minor_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Minor axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+```
+
+```{r}
+# boxplots with filtered data
+df_well <- filtered_plate %>%
+  group_by(Well_ID, Genotype_Name) %>%
+  summarise(across(all_of(feature_cols), mean), .groups = "drop") 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = area)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Nucleus area (pixels)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = mean_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Mean Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(std_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 5000, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = std_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Standard Deviation of Intensity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(eccentricity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = eccentricity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Eccentricity(Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold'))
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(solidity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = solidity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Solidity (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(perimeter) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 100, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = perimeter)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Perimeter (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(feret_diameter_max) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = feret_diameter_max)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "feret diameter max (Well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(major_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = major_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Major axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+
+y_lim <- df_well %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(minor_axis_length) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well, 
+       aes(x = Genotype_Name, 
+           y = minor_axis_length)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "Genotype",
+       y = "Minor axis length (Pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) 
+```
