@@ -3,7 +3,11 @@
 .RData
 .Ruserdata
 .vscode
+.DS_Store
+._.DS_Store
 Nucleus_segmentation/analysis/Output/
 Nucleus_segmentation/analysis/Output_run1/
 Nucleus_segmentation/analysis/Output_raw_run1/
 Nucleus_segmentation/analysis/test.csv
+bioinf_meetup_demo.ipynb
+*.png
