@@ -1,0 +1,1010 @@
+---
+title: "UMAP document"
+author: "test"
+format: html
+editor: visual
+---
+
+Set up different analysis notebooks for raw, subsetted, parental, and well averaged
+
+# Set up
+
+```{r}
+setwd("/vf/users/kelpschdj/iNDI/Production/Organelle_segmentation/Panel_1/analysis")
+numThreads <- RcppParallel::defaultNumThreads()
+```
+
+```{r}
+#| include: false
+#| label: Load packages
+
+package_list <- c("tidyverse", "uwot", "ranger", "arrow", "glue", "corrplot")
+new_packages <- package_list[!(package_list %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+lapply(package_list, library, character.only = TRUE)
+```
+
+# Import data
+
+```{r}
+filtered_org <- read_parquet("/vf/users/kelpschdj/iNDI/Production/Organelle_segmentation/Panel_1/analysis/output_files/Organelle_combined_filtered.parquet")
+```
+
+# Raw UMAPs
+
+```{r}
+feature_cols <- c(
+  "area_px", "coverage_frac", "organelle_count", "average_organelle_area",
+  "max_f_intensity", "mean_f_intensity", "median_f_intensity",
+  "CoefOfVar_intensity", "radial_mean", "radial_p25", "radial_p50",
+  "radial_p75", "inner_frac", "mid_frac", "outer_frac", "boundary_touch_frac"
+)
+
+corrplot(cor(filtered_org[, feature_cols], use = "complete.obs"), 
+         method = "color", type = "upper", tl.cex = 0.7)
+
+feature_cols <- c(
+  "area_px", "organelle_count", "average_organelle_area", "mean_f_intensity", "CoefOfVar_intensity", "radial_mean"
+)
+
+corrplot(cor(filtered_org[, feature_cols], use = "complete.obs"), 
+         method = "color", type = "upper", tl.cex = 0.7)
+
+set.seed(1)
+n_sample <- 500 # subset 500 samples per genotype and structure
+
+df_sub <- filtered_org %>%
+  distinct() %>%
+  filter(if_all(all_of(feature_cols), ~ !is.na(.))) %>%
+  group_by(iNDI_Plate_ID, Genotype_Name, Structure, experiment_design) %>%
+  group_modify(~ slice_sample(.x, n = min(n_sample, nrow(.x)))) %>%
+  ungroup()
+
+filtered_org %>% nrow
+df_sub %>% nrow() 
+
+df_sub %>% 
+  group_by(iNDI_Plate_ID, Genotype_Name, Structure, experiment_design) %>%
+  summarize(count = n()) %>%
+  filter(count < 500)
+
+X     <- df_sub[, feature_cols]
+X_sc  <- scale(X)
+X_pca <- prcomp(X_sc, center = FALSE, scale. = FALSE)$x[, 1:min(8, ncol(X))]
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+df_sub <- df_sub %>%
+  mutate(UMAP1 = umap_res[, 1],
+         UMAP2 = umap_res[, 2])
+
+#Plate UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_PlateID.png", p, width = 12, height = 12)
+
+# Experiment design UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_Design.png", p, width = 12, height = 12)
+
+# Structure UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Structure)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_Stain.png", p, width = 12, height = 12)
+
+# Genotype UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = "none") 
+ggsave("umap_Genotype.png", p, width = 12, height = 12)
+
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  facet_wrap(~iNDI_Plate_ID) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = "none") 
+ggsave("umap_Genotype_PlateID.png", p, width = 12, height = 12)
+```
+
+```{r}
+plate_ids <- unique(df_sub$iNDI_Plate_ID)
+
+walk(plate_ids, function(pid) {
+  df_plate <- df_sub %>% filter(iNDI_Plate_ID == pid)
+  
+  p <- ggplot(df_plate, aes(UMAP1, UMAP2)) +
+    geom_point(data = select(df_plate, -Genotype_Name), 
+               color = "grey80", size = 0.3, alpha = 0.3) +
+    geom_point(aes(color = Genotype_Name), alpha = 0.5, size = 0.3) +
+    facet_wrap(~ Genotype_Name) +
+    theme_minimal() +
+    labs(title = pid) +
+    guides(color = "none") 
+  
+  ggsave(glue("umap_{pid}.png"), p, width = 12, height = 12)
+})
+```
+
+# Well averaged analysis
+
+## UMAP
+
+```{r}
+# Generate a summary score for each feature by plate and well and then generate UMAPs
+dir.create("output_files/well_level_analysis")
+
+feature_cols <- c(
+  "area_px", "organelle_count", "average_organelle_area", "mean_f_intensity", "CoefOfVar_intensity", "radial_mean"
+)
+
+set.seed(1)
+
+df_sub <- filtered_org %>%
+  distinct() %>%
+  filter(if_all(all_of(feature_cols), ~ !is.na(.))) %>%
+  group_by(iNDI_Plate_ID, Genotype_Name, Structure, experiment_design, Well_ID) %>%
+  summarise(across(all_of(all_feature_cols), mean), .groups = "drop") 
+
+corrplot(cor(df_sub[, feature_cols], use = "complete.obs"), 
+         method = "color", type = "upper", tl.cex = 0.7)
+  
+X     <- df_sub[, feature_cols]
+X_sc  <- scale(X)
+X_pca <- prcomp(X_sc, center = FALSE, scale. = FALSE)$x[, 1:min(8, ncol(X))]
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1, verbose = TRUE, n_threads = numThreads)
+
+df_sub <- df_sub %>%
+  ungroup() %>%
+  mutate(UMAP1 = umap_res[, 1],
+         UMAP2 = umap_res[, 2])
+
+#Plate UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_well_PlateID.png", p, width = 12, height = 12, path = "output_files/well_level_analysis/")
+
+# Experiment design UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_well_Design.png", p, width = 12, height = 12, path = "output_files/well_level_analysis/")
+
+# Structure UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Structure)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_well_Stain.png", p, width = 12, height = 12, path = "output_files/well_level_analysis/")
+
+# Genotype UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = "none") 
+ggsave("umap_well_Genotype.png", p, width = 12, height = 12, path = "output_files/well_level_analysis/")
+
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype_Name)) +
+  facet_wrap(~iNDI_Plate_ID) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = "none") 
+ggsave("umap_well_Genotype_PlateID.png", p, width = 12, height = 12, path = "output_files/well_level_analysis/")
+```
+
+## Feature plot setup
+
+```{r}
+all_feature_cols <- c(
+  "area_px", "coverage_frac", "organelle_count", "average_organelle_area",
+  "max_f_intensity", "mean_f_intensity", "median_f_intensity",
+  "CoefOfVar_intensity", "radial_mean", "radial_p25", "radial_p50",
+  "radial_p75", "inner_frac", "mid_frac", "outer_frac", "boundary_touch_frac"
+)
+
+triplet_plates <- c("INDI00002D", "INDI00011D", "INDI00023D", "INDI00043D")
+```
+
+## Endosome feature plots
+
+```{r}
+df_well_endosome <- filtered_org %>%
+  filter(Structure == "Endosome") %>%
+  group_by(Well_ID, iNDI_Plate_ID, Batch_Info, experiment_design, Genotype_Name) %>%
+  summarise(across(all_of(all_feature_cols), mean), .groups = "drop") 
+
+# subset for plates with triplicate series
+df_well_endosome <- df_well_endosome %>%
+  filter(iNDI_Plate_ID %in% triplet_plates)
+
+y_lim <- df_well_endosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area_px) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 200, ceiling)
+
+ggplot(df_well_endosome, 
+       aes(x = Genotype_Name, 
+           y = area_px)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Segmented endosome area (pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("endosome_area_px.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_endosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(coverage_frac) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 0.01, ceiling)
+
+ggplot(df_well_endosome, 
+       aes(x = Genotype_Name, 
+           y = coverage_frac)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.01) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Coverage fraction (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+
+y_lim <- df_well_endosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(organelle_count) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well_endosome, 
+       aes(x = Genotype_Name, 
+           y = organelle_count)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Organelle count (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("endosome_count.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_endosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_f_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1000, ceiling)
+
+ggplot(df_well_endosome, 
+       aes(x = Genotype_Name, 
+           y = mean_f_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Mean fluroescent intensity (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("endosome_meanFluorescenceIntensity.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_endosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(radial_mean) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well_endosome, 
+       aes(x = Genotype_Name, 
+           y = radial_mean)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Radial mean (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("endosome_radialMean.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+```
+
+## Lysosome feature plots
+
+```{r}
+df_well_lysosome <- filtered_org %>%
+  filter(Structure == "Lysosome") %>%
+  group_by(Well_ID, iNDI_Plate_ID, Batch_Info, experiment_design, Genotype_Name) %>%
+  summarise(across(all_of(all_feature_cols), mean), .groups = "drop") 
+
+df_well_lysosome <- df_well_lysosome %>%
+  filter(iNDI_Plate_ID %in% triplet_plates)
+
+y_lim <- df_well_lysosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area_px) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 200, ceiling)
+
+ggplot(df_well_lysosome, 
+       aes(x = Genotype_Name, 
+           y = area_px)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Segmented lysosome area (pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("lysosome_area_px.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_lysosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(coverage_frac) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 0.01, ceiling)
+
+ggplot(df_well_lysosome, 
+       aes(x = Genotype_Name, 
+           y = coverage_frac)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.01) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Coverage fraction (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+
+y_lim <- df_well_lysosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(organelle_count) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well_lysosome, 
+       aes(x = Genotype_Name, 
+           y = organelle_count)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Organelle count (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("lysosome_count.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_lysosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_f_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1000, ceiling)
+
+ggplot(df_well_lysosome, 
+       aes(x = Genotype_Name, 
+           y = mean_f_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Mean fluroescent intensity (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("lysosome_meanFluorescenceIntensity.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_lysosome %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(radial_mean) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well_lysosome, 
+       aes(x = Genotype_Name, 
+           y = radial_mean)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Radial mean (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("lysosome_radialMean.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+```
+
+## Mitochondria feature plots
+
+```{r}
+df_well_mitochondria <- filtered_org %>%
+  filter(Structure == "Mitochondria") %>%
+  group_by(Well_ID, iNDI_Plate_ID, Batch_Info, experiment_design, Genotype_Name) %>%
+  summarise(across(all_of(all_feature_cols), mean), .groups = "drop") 
+
+df_well_mitochondria <- df_well_mitochondria %>%
+  filter(iNDI_Plate_ID %in% triplet_plates)
+
+y_lim <- df_well_mitochondria %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area_px) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 200, ceiling)
+
+ggplot(df_well_mitochondria, 
+       aes(x = Genotype_Name, 
+           y = area_px)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Segmented mitochondria area (pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("mitochondria_area_px.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_mitochondria %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(coverage_frac) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 0.01, ceiling)
+
+ggplot(df_well_mitochondria, 
+       aes(x = Genotype_Name, 
+           y = coverage_frac)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.01) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Coverage fraction (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+
+y_lim <- df_well_mitochondria %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(organelle_count) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 20, ceiling)
+
+ggplot(df_well_mitochondria, 
+       aes(x = Genotype_Name, 
+           y = organelle_count)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Organelle count (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("mitochondria_count.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_mitochondria %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_f_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1000, ceiling)
+
+ggplot(df_well_mitochondria, 
+       aes(x = Genotype_Name, 
+           y = mean_f_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Mean fluroescent intensity (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("mitochondria_meanFluorescenceIntensity.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+
+y_lim <- df_well_mitochondria %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(radial_mean) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well_mitochondria, 
+       aes(x = Genotype_Name, 
+           y = radial_mean)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Radial mean (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~iNDI_Plate_ID, scales = "free_x")
+ggsave("mitochondria_radialMean.png", width = 10, height = 4, path = "output_files/well_level_analysis/")
+```
+
+```{r}
+# General 'genotype' analysis
+feature_cols <- c(
+  "area_px", "organelle_count", "average_organelle_area", "mean_f_intensity", "CoefOfVar_intensity", "radial_mean"
+)
+
+set.seed(1)
+n_sample <- 500 # subset 500 samples per genotype and structure
+
+df_sub <- filtered_org %>%
+  distinct() %>%
+  filter(if_all(all_of(feature_cols), ~ !is.na(.))) %>%
+  group_by(iNDI_Plate_ID, Genotype, Structure, experiment_design) %>%
+  group_modify(~ slice_sample(.x, n = min(n_sample, nrow(.x)))) %>%
+  ungroup()
+
+filtered_org %>% nrow
+df_sub %>% nrow() 
+
+df_sub %>% 
+  group_by(iNDI_Plate_ID, Genotype, Structure, experiment_design) %>%
+  summarize(count = n()) 
+
+X     <- df_sub[, feature_cols]
+X_sc  <- scale(X)
+X_pca <- prcomp(X_sc, center = FALSE, scale. = FALSE)$x[, 1:min(8, ncol(X))]
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+df_sub <- df_sub %>%
+  mutate(UMAP1 = umap_res[, 1],
+         UMAP2 = umap_res[, 2])
+
+#Plate UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_gg_PlateID.png", p, width = 12, height = 12)
+
+# Experiment design UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_gg_Design.png", p, width = 12, height = 12)
+
+# Structure UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Structure)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_gg_Stain.png", p, width = 12, height = 12)
+
+# Genotype UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_gg_Genotype.png", p, width = 12, height = 12)
+
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Genotype)) +
+  facet_wrap(~iNDI_Plate_ID) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_gg_Genotype_PlateID.png", p, width = 12, height = 12)
+```
+
+# Parental analysis
+
+```{r}
+# Parental analysis
+feature_cols <- c(
+  "area_px", "organelle_count", "average_organelle_area", "mean_f_intensity", "CoefOfVar_intensity", "radial_mean"
+)
+
+set.seed(1)
+n_sample <- 500 # subset 500 samples per genotype and structure
+
+df_sub <- filtered_org %>%
+  distinct() %>%
+  filter(Genotype_Name == "Parental") %>%
+  filter(if_all(all_of(feature_cols), ~ !is.na(.))) %>%
+  group_by(iNDI_Plate_ID, Structure, experiment_design) %>%
+  group_modify(~ slice_sample(.x, n = min(n_sample, nrow(.x)))) %>%
+  ungroup()
+
+df %>% filter(Genotype_Name == "Parental") %>% nrow()
+
+X     <- df_sub[, feature_cols]
+X_sc  <- scale(X)
+X_pca <- prcomp(X_sc, center = FALSE, scale. = FALSE)$x[, 1:min(8, ncol(X))]
+umap_res <- umap(X_pca, n_neighbors = 15, min_dist = 0.1)
+
+df_sub <- df_sub %>%
+  mutate(UMAP1 = umap_res[, 1],
+         UMAP2 = umap_res[, 2])
+
+#Plate UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = iNDI_Plate_ID)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_parental_PlateID.png", p, width = 12, height = 12)
+
+# Experiment design UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = experiment_design)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_parental_Design.png", p, width = 12, height = 12)
+
+# Structure UMAP
+p <- ggplot(df_sub, aes(UMAP1, UMAP2, color = Structure)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 5)))
+ggsave("umap_parental_Stain.png", p, width = 12, height = 12)
+```
+
+```{r}
+all_feature_cols <- c(
+  "area_px", "coverage_frac", "organelle_count", "average_organelle_area",
+  "max_f_intensity", "mean_f_intensity", "median_f_intensity",
+  "CoefOfVar_intensity", "radial_mean", "radial_p25", "radial_p50",
+  "radial_p75", "inner_frac", "mid_frac", "outer_frac", "boundary_touch_frac"
+)
+
+df_well_parental <- filtered_org %>%
+  filter(Genotype_Name == "Parental") %>%
+  group_by(Well_ID, iNDI_Plate_ID, Batch_Info, experiment_design, Structure) %>%
+  summarise(across(all_of(all_feature_cols), mean), .groups = "drop") 
+
+y_lim <- df_well_parental %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(area_px) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1000, ceiling)
+
+ggplot(df_well_parental, 
+       aes(x = iNDI_Plate_ID, 
+           y = area_px)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Segmented area (pixels; well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~Structure)
+ggsave("parental_SegmentedArea.png", width = 10, height = 4)
+
+y_lim <- df_well_parental %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(organelle_count) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 10, ceiling)
+
+ggplot(df_well_parental, 
+       aes(x = iNDI_Plate_ID, 
+           y = organelle_count)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Organelle count (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~Structure)
+ggsave("parental_OrganelleCount.png", width = 10, height = 4)
+
+y_lim <- df_well_parental %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(mean_f_intensity) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 2000, ceiling)
+
+ggplot(df_well_parental, 
+       aes(x = iNDI_Plate_ID, 
+           y = mean_f_intensity)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Mean fluorescent intensity (well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~Structure)
+ggsave("parental_MeanFInt.png", width = 10, height = 4)
+
+y_lim <- df_well_parental %>% 
+  #filter(Outlier == "Normal") %>%
+  pull(radial_mean) %>% 
+  max(., na.rm = TRUE) %>% 
+  plyr::round_any(., 1, ceiling)
+
+ggplot(df_well_parental, 
+       aes(x = iNDI_Plate_ID, 
+           y = radial_mean)) +
+  geom_violin(fill = "skyblue",
+              alpha = 0.7,
+              scale = "width") +
+  geom_boxplot(width = 0.5,
+               outlier.shape = NA,
+               alpha = 0.5) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  scale_y_continuous(
+    labels = scales::comma, limits = c(0,y_lim), #c(lower limit, upper limit)
+    breaks = seq(0,y_lim,y_lim/5)) +  #seq(lower limit, upper limit, tick frequency)
+  labs(x = "iNDI plate ID",
+       y = "Radial mean (pixels, well averaged)") +
+  theme(
+    axis.text.x = element_text(face = 'bold', angle = 45, hjust = 1), 
+    axis.title.x = element_text(face = 'bold'),
+    axis.text.y = element_text(face = 'bold'), 
+    axis.title.y = element_text(face = 'bold'),
+    legend.title = element_text(face = 'bold'),
+    legend.text = element_text(face = 'bold'),
+    strip.text.x = element_text(face = 'bold')) +
+  facet_grid(~Structure)
+ggsave("parental_RadialMean.png", width = 10, height = 4)
+```
