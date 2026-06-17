@@ -16,3 +16,4 @@ Organelle_segmentation/Panel_1/results
 qc_figures/
 organelle_features/
 logs/
+*.pyc
