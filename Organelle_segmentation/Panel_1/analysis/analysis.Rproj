@@ -1,0 +1,16 @@
+Version: 1.0
+ProjectId: bfdf9a58-79f6-4388-be3a-64bbcad42d0e
+
+RestoreWorkspace: Default
+SaveWorkspace: Default
+AlwaysSaveHistory: Default
+
+EnableCodeIndexing: Yes
+UseSpacesForTab: Yes
+NumSpacesForTab: 2
+Encoding: UTF-8
+
+RnwWeave: Sweave
+LaTeX: pdfLaTeX
+
+ProjectName: organelle_seg_panel1_analysis
