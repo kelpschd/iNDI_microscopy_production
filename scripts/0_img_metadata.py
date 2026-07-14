@@ -12,6 +12,7 @@ from matplotlib.colors import LinearSegmentedColormap
 # Defaults; can be overridden on the command line (see parse_args).
 DEFAULT_METADATA_DIR = Path("/data/CARDPB2/iNDI/Production/metadata")
 DEFAULT_BASE_PATH = Path("/data/CARDPB2/iNDI/Production/AbPanel2")
+DEFAULT_OUTPUT_DIR = Path("./output/image_metadata")
 
 # Harmony XML namespace (consistent across experiments)
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
@@ -211,8 +212,9 @@ def parse_args():
     parser.add_argument(
         "-o", "--output-dir",
         type=Path,
-        default=None,
-        help="Optional directory to write one dated Parquet per experiment. "
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory to write one dated Parquet per experiment "
+             f"(default: {DEFAULT_OUTPUT_DIR}). "
              "Files are named <experiment>_metadata_<YYYYMMDD>.parquet.",
     )
     return parser.parse_args()
@@ -233,8 +235,7 @@ def main():
     print(f"Found {len(experiments)} experiment(s) to process.\n")
 
     today = datetime.now().strftime("%Y%m%d")
-    if args.output_dir is not None:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
     all_metadata = {}
     for experiment_path in experiments:
@@ -243,16 +244,15 @@ def main():
             continue
         all_metadata[experiment_path.name] = merged_df
 
-        if args.output_dir is not None:
-            out_path = args.output_dir / f"{experiment_path.name}_metadata_{today}.parquet"
-            # Drop the colormap objects (not serializable) and cast Path
-            # columns to str so pyarrow can write them.
-            out_df = merged_df.drop(columns=["MPL_colormap"], errors="ignore").copy()
-            for col in ("filepath", "subdirectory"):
-                if col in out_df.columns:
-                    out_df[col] = out_df[col].astype(str)
-            out_df.to_parquet(out_path, index=False)
-            print(f"Wrote {out_path}")
+        out_path = args.output_dir / f"{experiment_path.name}_metadata_{today}.parquet"
+        # Drop the colormap objects (not serializable) and cast Path
+        # columns to str so pyarrow can write them.
+        out_df = merged_df.drop(columns=["MPL_colormap"], errors="ignore").copy()
+        for col in ("filepath", "subdirectory"):
+            if col in out_df.columns:
+                out_df[col] = out_df[col].astype(str)
+        out_df.to_parquet(out_path, index=False)
+        print(f"Wrote {out_path}")
 
     # Combine everything into one big table (with an Experiment_name column).
     if all_metadata:
