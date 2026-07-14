@@ -29,9 +29,9 @@ DEFAULT_INPUT_DIR = Path("./output/image_metadata")
 DEFAULT_OUTPUT_DIR = Path("./output/nuclei_features")
 
 REGIONPROPS = (
-    "label", "area", "mean_intensity", "max_intensity", "min_intensity",
-    "std_intensity", "centroid", "eccentricity", "solidity", "perimeter",
-    "feret_diameter_max", "orientation", "major_axis_length", "minor_axis_length",
+    "label", "area", "intensity_mean", "intensity_max", "intensity_min",
+    "intensity_std", "centroid", "eccentricity", "solidity", "perimeter",
+    "feret_diameter_max", "orientation", "axis_major_length", "axis_minor_length",
 )
 
 
