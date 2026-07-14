@@ -245,10 +245,13 @@ def main():
 
         if args.output_dir is not None:
             out_path = args.output_dir / f"{experiment_path.name}_metadata_{today}.parquet"
-            # MPL_colormap holds colormap objects that don't serialize; drop it.
-            merged_df.drop(columns=["MPL_colormap"], errors="ignore").to_parquet(
-                out_path, index=False
-            )
+            # Drop the colormap objects (not serializable) and cast Path
+            # columns to str so pyarrow can write them.
+            out_df = merged_df.drop(columns=["MPL_colormap"], errors="ignore").copy()
+            for col in ("filepath", "subdirectory"):
+                if col in out_df.columns:
+                    out_df[col] = out_df[col].astype(str)
+            out_df.to_parquet(out_path, index=False)
             print(f"Wrote {out_path}")
 
     # Combine everything into one big table (with an Experiment_name column).
