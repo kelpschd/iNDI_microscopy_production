@@ -145,7 +145,10 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
         dfs = dask.compute(*tasks, scheduler=scheduler)
 
     features_df = pd.concat(dfs, ignore_index=True)
-    features_df["Experiment_name"] = exp_name
+
+    # Join each nucleus back to its source image's metadata row (one metadata
+    # row per DAPI image) so the features carry full provenance.
+    features_df = features_df.merge(samples, on="filepath", how="left")
 
     out_path = output_dir / f"{exp_name}_nuclei_features_{today}.parquet"
     features_df.to_parquet(out_path, index=False)
