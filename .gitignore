@@ -11,6 +11,12 @@ Nucleus_segmentation/analysis/Output_raw_run1/
 Nucleus_segmentation/analysis/test.csv
 bioinf_meetup_demo.ipynb
 *.png
+Organelle_segmentation/Panel_1/results
+*.parquet
+qc_figures/
+organelle_features/
+logs/
+*.pyc
 *.out
 *.arr
 *.err
