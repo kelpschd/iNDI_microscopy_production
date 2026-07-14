@@ -24,6 +24,10 @@ MIN_AREA = 3500
 # Which channel to segment on.
 CHANNEL_NAME = "DAPI"
 
+# Default input/output dirs (chain from the metadata script).
+DEFAULT_INPUT_DIR = Path("./output/image_metadata")
+DEFAULT_OUTPUT_DIR = Path("./output/nuclei_features")
+
 REGIONPROPS = (
     "label", "area", "mean_intensity", "max_intensity", "min_intensity",
     "std_intensity", "centroid", "eccentricity", "solidity", "perimeter",
@@ -69,8 +73,12 @@ def process_nucleus_image(image_path):
 
     filled = ndi.binary_fill_holes(img_high_level)
     filled = morphology.dilation(filled, footprint=morphology.disk(2))
-    labeled_filled = morphology.label(filled)
-    nuc_seg = morphology.remove_small_objects(labeled_filled, min_size=MIN_AREA)
+    # Label the filled mask, then drop objects below MIN_AREA. We filter the
+    # boolean mask (unambiguous for remove_small_objects) and relabel, which
+    # avoids the "only one label provided" warning that occurs when a label
+    # image happens to contain a single object.
+    filled_clean = morphology.remove_small_objects(filled.astype(bool), min_size=MIN_AREA)
+    nuc_seg = morphology.label(filled_clean)
 
     # Extract features
     props = regionprops_table(
@@ -155,8 +163,11 @@ def parse_args():
     )
     parser.add_argument(
         "input_dir",
+        nargs="?",
         type=Path,
-        help="Directory containing the metadata parquet files.",
+        default=DEFAULT_INPUT_DIR,
+        help="Directory containing the metadata parquet files "
+             f"(default: {DEFAULT_INPUT_DIR}).",
     )
     parser.add_argument(
         "-e", "--experiments",
@@ -169,8 +180,9 @@ def parse_args():
     parser.add_argument(
         "-o", "--output-dir",
         type=Path,
-        required=True,
-        help="Directory to write the nuclei-feature parquets.",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Directory to write the nuclei-feature parquets "
+             f"(default: {DEFAULT_OUTPUT_DIR}).",
     )
     parser.add_argument(
         "-s", "--scheduler",
