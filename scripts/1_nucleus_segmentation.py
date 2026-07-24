@@ -24,6 +24,10 @@ MIN_AREA = 3500
 # Which channel to segment on.
 CHANNEL_NAME = "DAPI"
 
+# Full-frame contrast gate: frames whose std is below this have nothing to
+# segment and are skipped before the (expensive) segmentation steps.
+CONTRAST_CUTOFF = 100
+
 # Default input/output dirs (chain from the metadata script).
 DEFAULT_INPUT_DIR = Path("./output/image_metadata")
 DEFAULT_OUTPUT_DIR = Path("./output/nuclei_features")
@@ -39,8 +43,33 @@ REGIONPROPS = (
 
 @delayed
 def process_nucleus_image(image_path):
-    """Segment nuclei in one image and return a per-object feature DataFrame."""
+    """Segment nuclei in one image.
+
+    Returns (features_df, status_dict). features_df is per-nucleus (empty if the
+    frame failed the contrast gate). status_dict is one per-image QC record.
+    """
+    image_name = os.path.basename(image_path)
     nuc = tifffile.imread(image_path)
+    frame_std = float(nuc.astype(np.float64).std())
+
+    status = {
+        "image_name": image_name,
+        "filepath": str(image_path),
+        "frame_std": frame_std,
+        "contrast_check": "pass",
+        "n_nuclei": 0,
+        "filter_status": "pass",
+        "fail_reason": "",
+    }
+
+    # Full-frame contrast gate: skip frames with nothing to segment.
+    if frame_std < CONTRAST_CUTOFF:
+        status.update(
+            contrast_check="fail",
+            filter_status="fail",
+            fail_reason="low_contrast",
+        )
+        return _empty_feature_df(image_path), status
 
     # Normalize via a fitted-Gaussian contrast stretch
     m, s = norm.fit(nuc.flatten())
@@ -73,10 +102,6 @@ def process_nucleus_image(image_path):
 
     filled = ndi.binary_fill_holes(img_high_level)
     filled = morphology.dilation(filled, footprint=morphology.disk(2))
-    # Label the filled mask, then drop objects below MIN_AREA. We filter the
-    # boolean mask (unambiguous for remove_small_objects) and relabel, which
-    # avoids the "only one label provided" warning that occurs when a label
-    # image happens to contain a single object.
     filled_clean = morphology.remove_small_objects(filled.astype(bool), min_size=MIN_AREA)
     nuc_seg = morphology.label(filled_clean)
 
@@ -87,12 +112,41 @@ def process_nucleus_image(image_path):
         properties=REGIONPROPS,
     )
     df = pd.DataFrame(props)
-    df["image_name"] = os.path.basename(image_path)
+    df["image_name"] = image_name
     df["filepath"] = str(image_path)
+    df["frame_std"] = frame_std
+
+    status["n_nuclei"] = len(df)
+    # A frame that passed contrast but yielded no nuclei is worth flagging.
+    if len(df) == 0:
+        status.update(filter_status="fail", fail_reason="no_nuclei_detected")
+
+    return df, status
+
+
+# --- helpers ------------------------------------------------------------
+
+def experiment_name_from_parquet(parquet_path, df):
+    """Best-effort experiment name: prefer the column, fall back to filename."""
+    if "Experiment_name" in df.columns and df["Experiment_name"].notna().any():
+        return str(df["Experiment_name"].iloc[0])
+    stem = parquet_path.stem
+    return stem.split("_metadata_")[0] if "_metadata_" in stem else stem
+
+def _empty_feature_df(image_path):
+    """Zero-row feature frame with the correct columns, for a frame that
+    produced no nuclei (contrast gate or empty segmentation)."""
+    cols = []
+    for p in REGIONPROPS:
+        if p == "centroid":
+            cols += ["centroid-0", "centroid-1"]
+        else:
+            cols.append(p)
+    df = pd.DataFrame(columns=cols)
+    df["image_name"] = pd.Series(dtype="object")
+    df["filepath"] = pd.Series(dtype="object")
+    df["frame_std"] = pd.Series(dtype="float64")
     return df
-
-
-# --- IO helpers ------------------------------------------------------------
 
 def discover_parquets(input_dir, selected=None):
     """Return metadata parquet paths under input_dir.
@@ -114,15 +168,6 @@ def discover_parquets(input_dir, selected=None):
     return chosen
 
 
-def experiment_name_from_parquet(parquet_path, df):
-    """Best-effort experiment name: prefer the column, fall back to filename."""
-    if "Experiment_name" in df.columns and df["Experiment_name"].notna().any():
-        return str(df["Experiment_name"].iloc[0])
-    # Strip a trailing _metadata_<date> if present, else use the stem.
-    stem = parquet_path.stem
-    return stem.split("_metadata_")[0] if "_metadata_" in stem else stem
-
-
 def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
     """Run segmentation for every DAPI image in one metadata parquet."""
     meta = pd.read_parquet(parquet_path)
@@ -142,19 +187,41 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
 
     tasks = [process_nucleus_image(fp) for fp in filepaths]
     with ProgressBar():
-        dfs = dask.compute(*tasks, scheduler=scheduler)
+        results = dask.compute(*tasks, scheduler=scheduler)
+
+    dfs = [r[0] for r in results]
+    statuses = [r[1] for r in results]
 
     features_df = pd.concat(dfs, ignore_index=True)
-
-    # Join each nucleus back to its source image's metadata row (one metadata
-    # row per DAPI image) so the features carry full provenance.
     features_df = features_df.merge(samples, on="filepath", how="left")
+
+    qc_df = pd.DataFrame(statuses)
+    qc_df = qc_df.merge(samples, on="filepath", how="left", suffixes=("", "_meta"))
 
     out_path = output_dir / f"{exp_name}_nuclei_features_{today}.parquet"
     features_df.to_parquet(out_path, index=False)
-    print(f"Wrote {out_path}  ({len(features_df)} nuclei)")
 
-    return features_df
+    qc_path = output_dir / f"{exp_name}_image_qc_{today}.parquet"
+    qc_df.to_parquet(qc_path, index=False)
+
+    # --- Per-experiment summary ---
+    total_images = len(qc_df)
+    passed_contrast = int((qc_df["contrast_check"] == "pass").sum())
+    total_nuclei = len(features_df)
+
+    print(f"\n--- {exp_name} summary ---")
+    print(f"  Total images:              {total_images}")
+    print(f"  Passed contrast check:     {passed_contrast}")
+    print(f"  Total nuclei detected:     {total_nuclei}")
+    print(f"  Wrote features -> {out_path}")
+    print(f"  Wrote QC       -> {qc_path}")
+
+    return {
+        "exp_name": exp_name,
+        "total_images": total_images,
+        "passed_contrast": passed_contrast,
+        "total_nuclei": total_nuclei,
+    }
 
 
 # --- Main ------------------------------------------------------------------
@@ -208,8 +275,25 @@ def main():
     parquets = discover_parquets(args.input_dir, args.experiments)
     print(f"Found {len(parquets)} metadata parquet(s) to process.")
 
+    all_stats = []
     for parquet_path in parquets:
-        process_metadata_parquet(parquet_path, args.output_dir, today, args.scheduler)
+        stats = process_metadata_parquet(parquet_path, args.output_dir, today, args.scheduler)
+        if stats is not None:
+            all_stats.append(stats)
+
+    # --- Grand total across all experiments ---
+    if all_stats:
+        total_images = sum(s["total_images"] for s in all_stats)
+        passed_contrast = sum(s["passed_contrast"] for s in all_stats)
+        total_nuclei = sum(s["total_nuclei"] for s in all_stats)
+
+        print("\n" + "=" * 40)
+        print("OVERALL SUMMARY")
+        print(f"  Experiments processed:     {len(all_stats)}")
+        print(f"  Total images:              {total_images}")
+        print(f"  Passed contrast check:     {passed_contrast}")
+        print(f"  Total nuclei detected:     {total_nuclei}")
+        print("=" * 40)
 
 
 if __name__ == "__main__":
