@@ -459,7 +459,7 @@ def stage_to_scratch(src_images_dir, mid):
         return None
     scratch_dir = f"{SCRATCH_BASE}/{mid}"
     subprocess.run(
-        ["rsync", "-a", f"{src_images_dir}/", f"{scratch_dir}/"],
+        ["rsync", "-a", "--info=progress2", f"{src_images_dir}/", f"{scratch_dir}/"],
         check=True,
     )
     return scratch_dir
