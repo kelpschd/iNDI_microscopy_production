@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import time
 import shutil
 import argparse
 import subprocess
@@ -20,6 +21,12 @@ from skimage.measure import label, regionprops_table
 from skimage.filters import threshold_triangle, threshold_otsu
 from skimage.morphology import remove_small_objects, erosion, dilation
 from skimage.morphology import disk as morph_disk
+
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
 
 # --- Configuration ---------------------------------------------------------
 
@@ -428,24 +435,40 @@ def _worker(args):
 # --- Parallel driver for one experiment ------------------------------------
 
 def run_experiment(samplesheet, nuclei_features, radius, n_workers):
+    t0 = time.time()
     sites = list(iter_sites(samplesheet, nuclei_features))
     total = len(sites)
-    print(f"  {total} site(s) -> {n_workers} workers")
+    print(f"  built {total} site(s) in {time.time() - t0:.1f}s")
 
     args_list = [(sm, sd, ns, radius) for sm, sd, ns in sites]
     out, completed = [], 0
 
+    print(f"  starting {n_workers} workers...")
+    t_pool = time.time()
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_worker, a): a[0] for a in args_list}
-        for fut in as_completed(futures):
+        first_done = True
+        completed_iter = as_completed(futures)
+        if _HAS_TQDM:
+            completed_iter = tqdm(
+                completed_iter, total=total, desc="  segmenting",
+                unit="frame", mininterval=5.0,
+            )
+        for fut in completed_iter:
             sm = futures[fut]
             completed += 1
+            if first_done:
+                print(f"  first task returned {time.time() - t_pool:.1f}s "
+                      f"after pool start (includes worker spawn)")
+                first_done = False
             df = fut.result()
             if df is not None and not df.empty:
                 out.append(df)
-                print(f"  [{completed}/{total}] {sm['dapi_filename']} -> {len(df)} rows")
+                n_rows = len(df)
             else:
-                print(f"  [{completed}/{total}] {sm['dapi_filename']} -> no data")
+                n_rows = 0
+            if not _HAS_TQDM:
+                print(f"  [{completed}/{total}] {sm['dapi_filename']} -> {n_rows} rows")
 
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
@@ -506,17 +529,21 @@ def process_filtered_parquet(parquet_path, src_base, output_dir, today,
     print(f"\n{exp_name}: {len(nuclei_features)} selected nuclei "
           f"across {nuclei_features['image_name'].nunique()} frame(s)")
 
+    t0 = time.time()
     samplesheet = build_samplesheet(experiment_path, panel)
     if samplesheet is None:
         print(f"[warning] could not build samplesheet for {exp_name}, skipping.")
         return None
+    print(f"  built samplesheet ({len(samplesheet)} rows) in {time.time() - t0:.1f}s")
 
     # Stage to scratch and remap filepaths, if scratch is available.
     src_images = experiment_path / "images"
     scratch_dir = None
     try:
+        t_stage = time.time()
         scratch_dir = stage_to_scratch(src_images, exp_name)
         if scratch_dir is not None:
+            print(f"  staged to scratch in {time.time() - t_stage:.1f}s")
             samplesheet["filepath"] = (
                 samplesheet["filepath"].astype(str)
                 .str.replace(str(src_images), scratch_dir, regex=False)
