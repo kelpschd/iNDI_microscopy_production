@@ -642,7 +642,7 @@ def main():
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
         print(f"  Organelle feature rows:    {total_rows}")
-        print(f"  Nuclei with organelles:    {total_nuc}")
+        print(f"  Nuclei with organelles:    {total_nuc}") # update this value - it is wrong
         print("=" * 40)
 
 
