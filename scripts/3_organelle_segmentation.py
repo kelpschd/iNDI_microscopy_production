@@ -19,8 +19,7 @@ from scipy.ndimage import (
 from skimage import filters, morphology
 from skimage.measure import label, regionprops_table
 from skimage.filters import threshold_triangle, threshold_otsu
-from skimage.feature import graycomatrix, graycoprops
-from skimage.morphology import remove_small_objects, erosion, dilation, opening
+from skimage.morphology import remove_small_objects, erosion, dilation
 from skimage.morphology import disk as morph_disk
 
 # --- run_utils bootstrap ---------------------------------------------------
@@ -100,16 +99,6 @@ AGG_STATS = {
     "p90":    lambda a: np.percentile(a, 90),
 }
 
-# Haralick / GLCM texture: one value per property per ROI (angle-averaged).
-GLCM_LEVELS = 256
-GLCM_DISTANCES = (1,)
-GLCM_ANGLES = (0, np.pi / 4, np.pi / 2, 3 * np.pi / 4)
-GLCM_PROPS = ("contrast", "dissimilarity", "homogeneity",
-              "energy", "correlation", "ASM")
-
-# Granularity: morphological opening spectrum. One value per radius.
-GRANULARITY_RADII = (1, 2, 4, 8, 16)
-
 
 def collect_params():
     """Full config snapshot recorded in run_metadata.json for this stage.
@@ -127,13 +116,6 @@ def collect_params():
         "shape_props": list(SHAPE_PROPS),
         "intensity_props": list(INTENSITY_PROPS),
         "agg_stats": list(AGG_STATS.keys()),
-        "glcm": {
-            "levels": GLCM_LEVELS,
-            "distances": list(GLCM_DISTANCES),
-            "angles": list(GLCM_ANGLES),
-            "props": list(GLCM_PROPS),
-        },
-        "granularity_radii": list(GRANULARITY_RADII),
     }
 
 
@@ -380,56 +362,6 @@ def _radial_distances(prop_table, keep_mask, roi_center_yx):
     return np.sqrt((cy - ry) ** 2 + (cx - rx) ** 2)
 
 
-def _haralick_features(ch_img, roi_mask, levels=GLCM_LEVELS):
-    """GLCM texture over the ROI's assigned-object region.
-
-    Returns {texture_<prop>: angle-averaged value}. NaNs if too few pixels.
-    Non-object pixels are zeroed so texture reflects the organelles, not the
-    surrounding cytoplasm (note: this introduces some edge contrast at object
-    boundaries).
-    """
-    ys, xs = np.where(roi_mask)
-    if ys.size < 2:
-        return {f"texture_{p}": np.nan for p in GLCM_PROPS}
-
-    y0, y1 = ys.min(), ys.max() + 1
-    x0, x1 = xs.min(), xs.max() + 1
-    crop = ch_img[y0:y1, x0:x1].astype(np.float64)
-    crop_mask = roi_mask[y0:y1, x0:x1]
-
-    cmin, cmax = crop[crop_mask].min(), crop[crop_mask].max()
-    if cmax <= cmin:
-        return {f"texture_{p}": np.nan for p in GLCM_PROPS}
-    q = ((crop - cmin) / (cmax - cmin) * (levels - 1)).astype(np.uint8)
-    q[~crop_mask] = 0
-
-    glcm = graycomatrix(q, distances=list(GLCM_DISTANCES),
-                        angles=list(GLCM_ANGLES), levels=levels,
-                        symmetric=True, normed=True)
-    return {f"texture_{p}": float(graycoprops(glcm, p).mean())
-            for p in GLCM_PROPS}
-
-
-def _granularity_spectrum(ch_img, roi_mask, radii=GRANULARITY_RADII):
-    """Fraction of intensity removed by opening at each radius.
-
-    One value per radius (percent of total ROI signal removed going from the
-    previous scale to this one); larger = more signal at that size scale.
-    """
-    region = ch_img.astype(np.float64) * roi_mask
-    total = region.sum()
-    if total <= 0:
-        return {f"granularity_r{r}": np.nan for r in radii}
-
-    out, prev = {}, region
-    for r in radii:
-        opened = opening(region, morph_disk(r))
-        removed = (prev.sum() - opened.sum()) / total * 100.0
-        out[f"granularity_r{r}"] = float(removed)
-        prev = opened
-    return out
-
-
 def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
                               nucleus_ids, radius, site_meta, row):
     """Segment one channel across the whole frame, assign objects to ROIs,
@@ -499,10 +431,6 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             float(np.mean(dists)) / radius if dists.size else np.nan
         )
 
-        # Texture + granularity (one set per ROI over the assigned region).
-        texture_summary = _haralick_features(ch_img, roi_mask)
-        granularity_summary = _granularity_spectrum(ch_img, roi_mask)
-
         rows.append({
             "Measurement_ID": site_meta.get("Measurement_ID"),
             "subdirectory": row.get("subdirectory"),
@@ -524,11 +452,9 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             "mean_f_intensity": int_mean,
             "median_f_intensity": int_median,
             "CoefOfVar_intensity": int_cv,
-            # expanded per-object distribution summaries + ROI texture/granularity
+            # expanded per-object distribution summaries + radial distance
             **shape_summary,
             **dist_summary,
-            **texture_summary,
-            **granularity_summary,
         })
     return rows
 
