@@ -19,7 +19,8 @@ from scipy.ndimage import (
 from skimage import filters, morphology
 from skimage.measure import label, regionprops_table
 from skimage.filters import threshold_triangle, threshold_otsu
-from skimage.morphology import remove_small_objects, erosion, dilation
+from skimage.feature import graycomatrix, graycoprops
+from skimage.morphology import remove_small_objects, erosion, dilation, opening
 from skimage.morphology import disk as morph_disk
 
 try:
@@ -70,6 +71,39 @@ PANEL_DESIGN = {
     1: {"DAPI": "DAPI", "Alexa 488": "TOMM20", "Alexa 568": "EEA1", "Alexa 647": "LAMP1"},
     2: {"DAPI": "DAPI", "Alexa 488": "RAB11A", "Alexa 568": "GM130", "Alexa 647": "TUJ1"},
 }
+
+# --- Per-object feature aggregation ---------------------------------------
+
+# Per-object shape props to measure with regionprops_table.
+SHAPE_PROPS = (
+    "area", "perimeter", "eccentricity", "solidity",
+    "extent", "axis_major_length", "axis_minor_length",
+    "equivalent_diameter_area", "orientation",
+)
+
+# Per-object intensity props (need intensity_image passed to regionprops).
+INTENSITY_PROPS = (
+    "intensity_mean", "intensity_max", "intensity_min",
+)
+
+# How to summarize each per-object feature across the ROI's objects.
+AGG_STATS = {
+    "mean":   np.mean,
+    "median": np.median,
+    "std":    np.std,
+    "p10":    lambda a: np.percentile(a, 10),
+    "p90":    lambda a: np.percentile(a, 90),
+}
+
+# Haralick / GLCM texture: one value per property per ROI (angle-averaged).
+GLCM_LEVELS = 256
+GLCM_DISTANCES = (1,)
+GLCM_ANGLES = (0, np.pi / 4, np.pi / 2, 3 * np.pi / 4)
+GLCM_PROPS = ("contrast", "dissimilarity", "homogeneity",
+              "energy", "correlation", "ASM")
+
+# Granularity: morphological opening spectrum. One value per radius.
+GRANULARITY_RADII = (1, 2, 4, 8, 16)
 
 
 # --- Segmenters (unchanged logic; now applied to the whole frame) ---------
@@ -287,10 +321,93 @@ def assign_objects_to_rois(obj_labels, centroids_yx, radius):
     return assignment
 
 
+# --- Per-ROI feature helpers ----------------------------------------------
+
+def _summarize_props(prop_table, keep_mask, props):
+    """Aggregate a per-object regionprops table down to per-ROI stats.
+
+    prop_table : dict from regionprops_table (has a 'label' column)
+    keep_mask  : boolean array (aligned to prop_table rows) selecting this
+                 ROI's objects
+    props      : which property columns to summarize
+    Returns a flat {feature_stat: value} dict.
+    """
+    out = {}
+    for p in props:
+        vals = np.asarray(prop_table[p], dtype=float)[keep_mask]
+        vals = vals[np.isfinite(vals)]
+        for stat, fn in AGG_STATS.items():
+            out[f"{p}_{stat}"] = float(fn(vals)) if vals.size else np.nan
+    return out
+
+
+def _radial_distances(prop_table, keep_mask, roi_center_yx):
+    """Distance from ROI center to each assigned object's centroid."""
+    cy = np.asarray(prop_table["centroid-0"], dtype=float)[keep_mask]
+    cx = np.asarray(prop_table["centroid-1"], dtype=float)[keep_mask]
+    ry, rx = roi_center_yx
+    return np.sqrt((cy - ry) ** 2 + (cx - rx) ** 2)
+
+
+def _haralick_features(ch_img, roi_mask, levels=GLCM_LEVELS):
+    """GLCM texture over the ROI's assigned-object region.
+
+    Returns {texture_<prop>: angle-averaged value}. NaNs if too few pixels.
+    Non-object pixels are zeroed so texture reflects the organelles, not the
+    surrounding cytoplasm (note: this introduces some edge contrast at object
+    boundaries).
+    """
+    ys, xs = np.where(roi_mask)
+    if ys.size < 2:
+        return {f"texture_{p}": np.nan for p in GLCM_PROPS}
+
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    crop = ch_img[y0:y1, x0:x1].astype(np.float64)
+    crop_mask = roi_mask[y0:y1, x0:x1]
+
+    cmin, cmax = crop[crop_mask].min(), crop[crop_mask].max()
+    if cmax <= cmin:
+        return {f"texture_{p}": np.nan for p in GLCM_PROPS}
+    q = ((crop - cmin) / (cmax - cmin) * (levels - 1)).astype(np.uint8)
+    q[~crop_mask] = 0
+
+    glcm = graycomatrix(q, distances=list(GLCM_DISTANCES),
+                        angles=list(GLCM_ANGLES), levels=levels,
+                        symmetric=True, normed=True)
+    return {f"texture_{p}": float(graycoprops(glcm, p).mean())
+            for p in GLCM_PROPS}
+
+
+def _granularity_spectrum(ch_img, roi_mask, radii=GRANULARITY_RADII):
+    """Fraction of intensity removed by opening at each radius.
+
+    One value per radius (percent of total ROI signal removed going from the
+    previous scale to this one); larger = more signal at that size scale.
+    """
+    region = ch_img.astype(np.float64) * roi_mask
+    total = region.sum()
+    if total <= 0:
+        return {f"granularity_r{r}": np.nan for r in radii}
+
+    out, prev = {}, region
+    for r in radii:
+        opened = opening(region, morph_disk(r))
+        removed = (prev.sum() - opened.sum()) / total * 100.0
+        out[f"granularity_r{r}"] = float(removed)
+        prev = opened
+    return out
+
+
 def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
                               nucleus_ids, radius, site_meta, row):
     """Segment one channel across the whole frame, assign objects to ROIs,
-    and return per-nucleus organelle feature rows."""
+    and return per-nucleus organelle feature rows.
+
+    Per-object shape/intensity and radial distance are summarized across each
+    ROI's objects; texture and granularity are computed once per ROI over its
+    assigned-object region.
+    """
     mask = seg_fn(ch_img)
     obj_labels = label(mask, connectivity=1)
     if obj_labels.max() == 0:
@@ -305,13 +422,25 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
     for obj_lab, roi_idx in assignment.items():
         by_roi.setdefault(roi_idx, []).append(obj_lab)
 
+    # One per-object table for the whole frame; filtered per ROI below.
+    # Object identity is preserved exactly as assign_objects_to_rois decided.
+    prop_table = regionprops_table(
+        obj_labels,
+        intensity_image=ch_img,
+        properties=("label", "centroid") + SHAPE_PROPS + INTENSITY_PROPS,
+    )
+    table_labels = np.asarray(prop_table["label"])
+
     rows = []
     for roi_idx, obj_labs in by_roi.items():
+        keep_mask = np.isin(table_labels, obj_labs)
+
         roi_mask = np.isin(obj_labels, obj_labs)
-        vals = ch_img[roi_mask]
-        area_px = int(roi_mask.sum())
+        vals = ch_img[roi_mask]           # pooled-pixel intensity (kept as-is)
+        area_px = int(roi_mask.sum())     # total organelle area in ROI
         count_obj = len(obj_labs)
 
+        # Pooled-pixel intensity summary (unchanged behavior).
         if vals.size:
             int_max = float(vals.max())
             int_sum = float(vals.sum())
@@ -323,6 +452,26 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             int_mean = int_median = int_std = np.nan
         int_cv = (int_std / int_mean) if (not np.isnan(int_mean) and int_mean != 0) else np.nan
 
+        # Per-object shape + intensity, summarized across this ROI's objects.
+        shape_summary = _summarize_props(
+            prop_table, keep_mask, SHAPE_PROPS + INTENSITY_PROPS
+        )
+
+        # Radial distance (per-object -> summarized).
+        dists = _radial_distances(prop_table, keep_mask, centroids_yx[roi_idx])
+        dists = dists[np.isfinite(dists)]
+        dist_summary = {
+            f"dist_to_centroid_{s}": (float(fn(dists)) if dists.size else np.nan)
+            for s, fn in AGG_STATS.items()
+        }
+        dist_summary["dist_to_centroid_norm_mean"] = (
+            float(np.mean(dists)) / radius if dists.size else np.nan
+        )
+
+        # Texture + granularity (one set per ROI over the assigned region).
+        texture_summary = _haralick_features(ch_img, roi_mask)
+        granularity_summary = _granularity_spectrum(ch_img, roi_mask)
+
         rows.append({
             "Measurement_ID": site_meta.get("Measurement_ID"),
             "subdirectory": row.get("subdirectory"),
@@ -333,14 +482,22 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             "Structure": structure,
             "Stain": row.get("Stain"),
             "Nucleus_ID": int(nucleus_ids[roi_idx]),
+            # ROI-level (count-level) metrics
             "area_px": area_px,
             "organelle_count": count_obj,
             "average_organelle_area": (area_px / count_obj) if count_obj else 0.0,
+            "roi_occupancy": area_px / (np.pi * radius ** 2),
+            # pooled-pixel intensity (existing columns, kept for continuity)
             "max_f_intensity": int_max,
             "sum_f_intensity": int_sum,
             "mean_f_intensity": int_mean,
             "median_f_intensity": int_median,
             "CoefOfVar_intensity": int_cv,
+            # expanded per-object distribution summaries + ROI texture/granularity
+            **shape_summary,
+            **dist_summary,
+            **texture_summary,
+            **granularity_summary,
         })
     return rows
 
@@ -642,9 +799,9 @@ def main():
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
         print(f"  Organelle feature rows:    {total_rows}")
-        print(f"  Nuclei with organelles:    {total_nuc}") # update this value - it is wrong
+        print(f"  Nuclei with organelles:    {total_nuc}")
         print("=" * 40)
 
 
 if __name__ == "__main__":
-    main()
+    main()</document_content>
