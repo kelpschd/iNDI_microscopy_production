@@ -1,6 +1,6 @@
 import os
+import sys
 import argparse
-from datetime import datetime
 from pathlib import Path
 
 import dask
@@ -13,6 +13,10 @@ from scipy import ndimage as ndi
 from scipy.stats import norm
 from skimage import filters, morphology
 from skimage.measure import regionprops_table
+
+# --- run_utils bootstrap ---------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 # --- Configuration ---------------------------------------------------------
 
@@ -28,15 +32,28 @@ CHANNEL_NAME = "DAPI"
 # segment and are skipped before the (expensive) segmentation steps.
 CONTRAST_CUTOFF = 100
 
-# Default input/output dirs (chain from the metadata script).
-DEFAULT_INPUT_DIR = Path("./output/image_metadata")
-DEFAULT_OUTPUT_DIR = Path("./output/nuclei_features")
+# Stage name + the sub-dirs this stage reads from / writes to inside a run.
+STAGE = "nucleus_segmentation"
+INPUT_STAGE_DIR = "image_metadata"
+OUTPUT_STAGE_DIR = "nuclei_features"
 
 REGIONPROPS = (
     "label", "area", "intensity_mean", "intensity_max", "intensity_min",
     "intensity_std", "centroid", "eccentricity", "solidity", "perimeter",
     "feret_diameter_max", "orientation", "axis_major_length", "axis_minor_length",
 )
+
+
+def collect_params():
+    """Tuning constants recorded in run_metadata.json for this stage."""
+    return {
+        "intensity_scaling_param": INTENSITY_SCALING_PARAM,
+        "blur_sigma": BLUR_SIGMA,
+        "min_area": MIN_AREA,
+        "channel_name": CHANNEL_NAME,
+        "contrast_cutoff": CONTRAST_CUTOFF,
+        "regionprops": list(REGIONPROPS),
+    }
 
 
 # --- Segmentation ----------------------------------------------------------
@@ -131,7 +148,8 @@ def experiment_name_from_parquet(parquet_path, df):
     if "Experiment_name" in df.columns and df["Experiment_name"].notna().any():
         return str(df["Experiment_name"].iloc[0])
     stem = parquet_path.stem
-    return stem.split("_metadata_")[0] if "_metadata_" in stem else stem
+    # Filenames are now '<exp>_metadata.parquet' (run dir carries the date).
+    return stem.split("_metadata")[0] if "_metadata" in stem else stem
 
 def _empty_feature_df(image_path):
     """Zero-row feature frame with the correct columns, for a frame that
@@ -168,7 +186,7 @@ def discover_parquets(input_dir, selected=None):
     return chosen
 
 
-def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
+def process_metadata_parquet(parquet_path, output_dir, scheduler, rec):
     """Run segmentation for every DAPI image in one metadata parquet."""
     meta = pd.read_parquet(parquet_path)
 
@@ -184,6 +202,7 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
     filepaths = samples["filepath"].tolist()
     exp_name = experiment_name_from_parquet(parquet_path, meta)
     print(f"\n{exp_name}: segmenting {len(filepaths)} {CHANNEL_NAME} image(s)...")
+    rec.log(f"{exp_name}: segmenting {len(filepaths)} {CHANNEL_NAME} image(s)")
 
     tasks = [process_nucleus_image(fp) for fp in filepaths]
     with ProgressBar():
@@ -198,10 +217,10 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
     qc_df = pd.DataFrame(statuses)
     qc_df = qc_df.merge(samples, on="filepath", how="left", suffixes=("", "_meta"))
 
-    out_path = output_dir / f"{exp_name}_nuclei_features_{today}.parquet"
+    out_path = output_dir / f"{exp_name}_nuclei_features.parquet"
     features_df.to_parquet(out_path, index=False)
 
-    qc_path = output_dir / f"{exp_name}_image_qc_{today}.parquet"
+    qc_path = output_dir / f"{exp_name}_image_qc.parquet"
     qc_df.to_parquet(qc_path, index=False)
 
     # --- Per-experiment summary ---
@@ -215,6 +234,8 @@ def process_metadata_parquet(parquet_path, output_dir, today, scheduler):
     print(f"  Total nuclei detected:     {total_nuclei}")
     print(f"  Wrote features -> {out_path}")
     print(f"  Wrote QC       -> {qc_path}")
+    rec.log(f"{exp_name}: {total_nuclei} nuclei from {passed_contrast}/"
+            f"{total_images} frames -> {out_path.name}")
 
     return {
         "exp_name": exp_name,
@@ -232,14 +253,6 @@ def parse_args():
                     "per-experiment nuclei-feature parquets."
     )
     parser.add_argument(
-        "input_dir",
-        nargs="?",
-        type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help="Directory containing the metadata parquet files "
-             f"(default: {DEFAULT_INPUT_DIR}).",
-    )
-    parser.add_argument(
         "-e", "--experiments",
         nargs="+",
         default=None,
@@ -248,45 +261,52 @@ def parse_args():
              "filename prefixes). If omitted, all parquets are processed.",
     )
     parser.add_argument(
-        "-o", "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory to write the nuclei-feature parquets "
-             f"(default: {DEFAULT_OUTPUT_DIR}).",
-    )
-    parser.add_argument(
         "-s", "--scheduler",
         default="processes",
         choices=["processes", "threads", "single-threaded", "synchronous"],
         help="Dask scheduler to use (default: processes).",
     )
+    # --output-root + --run-id (required here: reuse the run minted by 0_).
+    ru.add_run_args(parser, mints_run_id=False)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if not args.input_dir.is_dir():
-        raise SystemExit(f"[error] input dir is not a directory: {args.input_dir}")
+    # Resolve the existing run dir (errors clearly if the run ID is wrong).
+    run_dir = ru.resolve_run_dir(args.output_root, args.run_id)
+    input_dir = ru.stage_dir(run_dir, INPUT_STAGE_DIR)
+    output_dir = ru.stage_dir(run_dir, OUTPUT_STAGE_DIR)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
+    rec = ru.StageRecorder(
+        run_dir, stage=STAGE, run_id=args.run_id,
+        params=collect_params(),
+        inputs={
+            "input_dir": str(input_dir),
+            "scheduler": args.scheduler,
+            "experiments_requested": args.experiments or "ALL",
+        },
+    )
+    print(f"\n=== RUN ID: {args.run_id} ===")
+    print(f"=== run dir: {run_dir} ===\n")
 
-    parquets = discover_parquets(args.input_dir, args.experiments)
+    parquets = discover_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} metadata parquet(s) to process.")
+    rec.log(f"found {len(parquets)} metadata parquet(s) in {input_dir}")
 
     all_stats = []
     for parquet_path in parquets:
-        stats = process_metadata_parquet(parquet_path, args.output_dir, today, args.scheduler)
+        stats = process_metadata_parquet(parquet_path, output_dir, args.scheduler, rec)
         if stats is not None:
             all_stats.append(stats)
 
     # --- Grand total across all experiments ---
-    if all_stats:
-        total_images = sum(s["total_images"] for s in all_stats)
-        passed_contrast = sum(s["passed_contrast"] for s in all_stats)
-        total_nuclei = sum(s["total_nuclei"] for s in all_stats)
+    total_images = sum(s["total_images"] for s in all_stats)
+    passed_contrast = sum(s["passed_contrast"] for s in all_stats)
+    total_nuclei = sum(s["total_nuclei"] for s in all_stats)
 
+    if all_stats:
         print("\n" + "=" * 40)
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
@@ -294,6 +314,19 @@ def main():
         print(f"  Passed contrast check:     {passed_contrast}")
         print(f"  Total nuclei detected:     {total_nuclei}")
         print("=" * 40)
+
+    rec.finish(
+        outputs={"nuclei_features_dir": str(output_dir)},
+        summary={
+            "experiments_processed": len(all_stats),
+            "total_images": total_images,
+            "passed_contrast": passed_contrast,
+            "total_nuclei": total_nuclei,
+            "per_experiment": all_stats,
+        },
+    )
+
+    print(f"\n=== RUN ID: {args.run_id} (pass to downstream stages) ===")
 
 
 if __name__ == "__main__":

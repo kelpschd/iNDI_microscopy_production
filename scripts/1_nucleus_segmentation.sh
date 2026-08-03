@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=indi_nuc_segmentation
-#SBATCH --output=logs/indi_nuc_segmentation%j.out
-#SBATCH --error=logs/indi_nuc_segmentation%j.err
+#SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_nuc_segmentation_%j.out
+#SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_nuc_segmentation_%j.err
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
@@ -19,6 +19,6 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 python /data/kelpschdj/iNDI/Production/scripts/1_nucleus_segmentation.py \
-    "/data/kelpschdj/iNDI/Production/Nucleus_segmentation/output/image_metadata" \
-    -o "/data/kelpschdj/iNDI/Production/Nucleus_segmentation/output/nuclei_features" \
+    --run-id 20260803_124616_6otz \
+    --output-root /data/kelpschdj/iNDI/Production/outputs \
     -s processes
