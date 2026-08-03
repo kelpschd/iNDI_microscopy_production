@@ -26,6 +26,7 @@ logs/
 *.csv
 *.parquet
 *.png
+# after repo clean up, consider removing these
 qc_figures/
 organelle_features/
 Organelle_segmentation/Panel_1/results/
@@ -35,3 +36,6 @@ Nucleus_segmentation/analysis/Output_raw_run1/
 
 # --- Misc ---
 bioinf_meetup_demo.ipynb
+
+# --- Pipeline run outputs ---
+outputs/
