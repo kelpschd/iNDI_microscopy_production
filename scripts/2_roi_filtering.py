@@ -1,10 +1,14 @@
+import sys
 import argparse
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import tifffile
+
+# --- run_utils bootstrap ---------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 # --- Configuration ---------------------------------------------------------
 
@@ -18,12 +22,25 @@ OVERLAP_FRACTION = 0.05   # fail if a pair overlaps by more than this fraction o
 DEFAULT_FRAME_H = 2160
 DEFAULT_FRAME_W = 2160
 
-# Default input/output dirs (chain from the segmentation script).
-DEFAULT_INPUT_DIR = Path("./output/nuclei_features")
-DEFAULT_OUTPUT_DIR = Path("./output/nuclei_filtered")
+# Stage name + the sub-dirs this stage reads from / writes to inside a run.
+STAGE = "roi_filtering"
+INPUT_STAGE_DIR = "nuclei_features"
+OUTPUT_STAGE_DIR = "nuclei_filtered"
 
 # The per-ROI check columns this script produces.
 CHECK_COLS = ["area_check", "edge_check", "overlap_check"]
+
+
+def collect_params():
+    """Tuning constants recorded in run_metadata.json for this stage."""
+    return {
+        "roi_radius": ROI_RADIUS,
+        "area_max": AREA_MAX,
+        "overlap_fraction": OVERLAP_FRACTION,
+        "default_frame_h": DEFAULT_FRAME_H,
+        "default_frame_w": DEFAULT_FRAME_W,
+        "check_cols": list(CHECK_COLS),
+    }
 
 
 # --- Geometry --------------------------------------------------------------
@@ -143,7 +160,7 @@ def apply_filters(features_df, H, W):
 def experiment_name_from_parquet(parquet_path):
     """Best-effort experiment name from the features-parquet filename."""
     stem = parquet_path.stem
-    return stem.split("_nuclei_features_")[0] if "_nuclei_features_" in stem else stem
+    return stem.split("_nuclei_features")[0] if "_nuclei_features" in stem else stem
 
 
 def discover_feature_parquets(input_dir, selected=None):
@@ -152,7 +169,7 @@ def discover_feature_parquets(input_dir, selected=None):
     If `selected` is given, only parquets whose filename starts with one of
     those experiment names are returned.
     """
-    all_parquets = sorted(input_dir.glob("*_nuclei_features_*.parquet"))
+    all_parquets = sorted(input_dir.glob("*_nuclei_features*.parquet"))
     if selected is None:
         return all_parquets
 
@@ -166,7 +183,7 @@ def discover_feature_parquets(input_dir, selected=None):
     return chosen
 
 
-def process_feature_parquet(parquet_path, output_dir, today, frame_size_override):
+def process_feature_parquet(parquet_path, output_dir, frame_size_override, rec):
     """Apply ROI filters to one experiment's feature parquet."""
     features_df = pd.read_parquet(parquet_path)
     exp_name = experiment_name_from_parquet(parquet_path)
@@ -183,11 +200,12 @@ def process_feature_parquet(parquet_path, output_dir, today, frame_size_override
 
     print(f"\n{exp_name}: filtering {len(features_df)} nuclei "
           f"across {features_df['image_name'].nunique()} frame(s)...")
+    rec.log(f"{exp_name}: filtering {len(features_df)} nuclei")
 
     H, W = resolve_frame_size(features_df, frame_size_override)
     annotated = apply_filters(features_df, H, W)
 
-    out_path = output_dir / f"{exp_name}_nuclei_filtered_{today}.parquet"
+    out_path = output_dir / f"{exp_name}_nuclei_filtered.parquet"
     annotated.to_parquet(out_path, index=False)
 
     # --- Per-experiment summary ---
@@ -205,6 +223,8 @@ def process_feature_parquet(parquet_path, output_dir, today, frame_size_override
     print(f"  Selected (pass all):       {n_selected} "
           f"({n_selected / total * 100:.1f}%)")
     print(f"  Wrote -> {out_path}")
+    rec.log(f"{exp_name}: {n_selected}/{total} selected "
+            f"({n_selected / total * 100:.1f}%) -> {out_path.name}")
 
     return {
         "exp_name": exp_name,
@@ -232,27 +252,12 @@ def parse_args():
                     "per-experiment nuclei-feature parquets."
     )
     parser.add_argument(
-        "input_dir",
-        nargs="?",
-        type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help="Directory containing the nuclei-feature parquet files "
-             f"(default: {DEFAULT_INPUT_DIR}).",
-    )
-    parser.add_argument(
         "-e", "--experiments",
         nargs="+",
         default=None,
         metavar="NAME",
         help="Specific experiment names to process (matched against parquet "
              "filename prefixes). If omitted, all parquets are processed.",
-    )
-    parser.add_argument(
-        "-o", "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory to write the filtered parquets "
-             f"(default: {DEFAULT_OUTPUT_DIR}).",
     )
     parser.add_argument(
         "--frame-size",
@@ -263,37 +268,54 @@ def parse_args():
              "is read from one image per experiment, falling back to "
              f"{DEFAULT_FRAME_H}x{DEFAULT_FRAME_W}.",
     )
+    # --output-root + --run-id (required here: reuse the run minted by 0_).
+    ru.add_run_args(parser, mints_run_id=False)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if not args.input_dir.is_dir():
-        raise SystemExit(f"[error] input dir is not a directory: {args.input_dir}")
+    # Resolve the existing run dir (errors clearly if the run ID is wrong).
+    run_dir = ru.resolve_run_dir(args.output_root, args.run_id)
+    input_dir = ru.stage_dir(run_dir, INPUT_STAGE_DIR)
+    output_dir = ru.stage_dir(run_dir, OUTPUT_STAGE_DIR)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
+    rec = ru.StageRecorder(
+        run_dir, stage=STAGE, run_id=args.run_id,
+        params=collect_params(),
+        inputs={
+            "input_dir": str(input_dir),
+            "frame_size_override": (
+                f"{args.frame_size[0]}x{args.frame_size[1]}"
+                if args.frame_size else None
+            ),
+            "experiments_requested": args.experiments or "ALL",
+        },
+    )
+    print(f"\n=== RUN ID: {args.run_id} ===")
+    print(f"=== run dir: {run_dir} ===\n")
 
-    parquets = discover_feature_parquets(args.input_dir, args.experiments)
+    parquets = discover_feature_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} feature parquet(s) to process.")
+    rec.log(f"found {len(parquets)} feature parquet(s) in {input_dir}")
 
     all_stats = []
     for parquet_path in parquets:
         stats = process_feature_parquet(
-            parquet_path, args.output_dir, today, args.frame_size
+            parquet_path, output_dir, args.frame_size, rec
         )
         if stats is not None:
             all_stats.append(stats)
 
     # --- Grand total across all experiments ---
-    if all_stats:
-        total = sum(s["total"] for s in all_stats)
-        n_area_fail = sum(s["n_area_fail"] for s in all_stats)
-        n_edge_fail = sum(s["n_edge_fail"] for s in all_stats)
-        n_overlap_fail = sum(s["n_overlap_fail"] for s in all_stats)
-        n_selected = sum(s["n_selected"] for s in all_stats)
+    total = sum(s["total"] for s in all_stats)
+    n_area_fail = sum(s["n_area_fail"] for s in all_stats)
+    n_edge_fail = sum(s["n_edge_fail"] for s in all_stats)
+    n_overlap_fail = sum(s["n_overlap_fail"] for s in all_stats)
+    n_selected = sum(s["n_selected"] for s in all_stats)
 
+    if all_stats:
         print("\n" + "=" * 40)
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
@@ -304,6 +326,22 @@ def main():
         print(f"  Selected (pass all):       {n_selected} "
               f"({n_selected / total * 100:.1f}%)")
         print("=" * 40)
+
+    rec.finish(
+        outputs={"nuclei_filtered_dir": str(output_dir)},
+        summary={
+            "experiments_processed": len(all_stats),
+            "total_nuclei": total,
+            "n_area_fail": n_area_fail,
+            "n_edge_fail": n_edge_fail,
+            "n_overlap_fail": n_overlap_fail,
+            "n_selected": n_selected,
+            "selected_fraction": round(n_selected / total, 4) if total else None,
+            "per_experiment": all_stats,
+        },
+    )
+
+    print(f"\n=== RUN ID: {args.run_id} (pass to downstream stages) ===")
 
 
 if __name__ == "__main__":
