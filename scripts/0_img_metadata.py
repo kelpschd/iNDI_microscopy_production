@@ -1,18 +1,23 @@
 import re
+import sys
 import argparse
-from datetime import datetime
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 
+# --- run_utils bootstrap ---------------------------------------------------
+# Make `import run_utils` work regardless of where the script is launched from
+# (repo root, scripts/, or a SLURM job with an arbitrary cwd).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
+
 # --- Configuration ---------------------------------------------------------
 
 # Defaults; can be overridden on the command line (see parse_args).
 DEFAULT_METADATA_DIR = Path("/data/CARDPB2/iNDI/Production/metadata")
 DEFAULT_BASE_PATH = Path("/data/CARDPB2/iNDI/Production/AbPanel2")
-DEFAULT_OUTPUT_DIR = Path("./output/image_metadata")
 
 # Harmony XML namespace (consistent across experiments)
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
@@ -35,6 +40,18 @@ MPL_COLORMAPS = {
 }
 
 FILENAME_RE = re.compile(r"r(\d+)c(\d+)f(\d+)p(\d+)-ch(\d+)t(\d+)")
+
+# Stage name used in run metadata / logs.
+STAGE = "image_metadata"
+
+
+def collect_params():
+    """Tuning constants recorded in run_metadata.json for this stage."""
+    return {
+        "pseudocolor_map": PSEUDOCOLOR_MAP,
+        "harmony_namespace": NS["h"],
+        "filename_regex": FILENAME_RE.pattern,
+    }
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -209,14 +226,8 @@ def parse_args():
         help=f"Directory containing the plate metadata CSVs "
              f"(default: {DEFAULT_METADATA_DIR}).",
     )
-    parser.add_argument(
-        "-o", "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory to write one dated Parquet per experiment "
-             f"(default: {DEFAULT_OUTPUT_DIR}). "
-             "Files are named <experiment>_metadata_<YYYYMMDD>.parquet.",
-    )
+    # --output-root + --run-id (optional here: stage 0_ mints the run ID).
+    ru.add_run_args(parser, mints_run_id=True)
     return parser.parse_args()
 
 
@@ -226,25 +237,48 @@ def main():
     if not args.base_path.is_dir():
         raise SystemExit(f"[error] base path is not a directory: {args.base_path}")
 
+    # Mint (or accept) the run ID and create the run directory.
+    run_id = args.run_id or ru.new_run_id()
+    run_dir = ru.create_run_dir(args.output_root, run_id)
+    out_dir = ru.stage_dir(run_dir, STAGE)
+
+    rec = ru.StageRecorder(
+        run_dir, stage=STAGE, run_id=run_id,
+        params=collect_params(),
+        inputs={
+            "base_path": str(args.base_path),
+            "metadata_dir": str(args.metadata_dir),
+            "experiments_requested": args.experiments or "ALL",
+        },
+    )
+    # Make the run ID obvious in stdout — downstream stages need it.
+    print(f"\n=== RUN ID: {run_id} ===")
+    print(f"=== run dir: {run_dir} ===\n")
+    rec.log(f"run id {run_id}")
+
     # Load shared metadata CSVs once.
     automated_plates = pd.read_csv(args.metadata_dir / "all_automated_plates_combined.csv")
     manual_plates = pd.read_csv(args.metadata_dir / "all_manual_plates_combined.csv")
     plate_id_map = pd.read_csv(args.metadata_dir / "indi_plateID_to_folderID.csv")
 
     experiments = discover_experiments(args.base_path, args.experiments)
+    rec.log(f"found {len(experiments)} experiment(s) to process")
     print(f"Found {len(experiments)} experiment(s) to process.\n")
 
-    today = datetime.now().strftime("%Y%m%d")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
     all_metadata = {}
+    per_experiment = []
     for experiment_path in experiments:
         merged_df = process_experiment(experiment_path)
         if merged_df is None:
+            per_experiment.append({
+                "experiment": experiment_path.name,
+                "status": "skipped",
+                "n_images": 0,
+            })
             continue
         all_metadata[experiment_path.name] = merged_df
 
-        out_path = args.output_dir / f"{experiment_path.name}_metadata_{today}.parquet"
+        out_path = out_dir / f"{experiment_path.name}_metadata.parquet"
         # Drop the colormap objects (not serializable) and cast Path
         # columns to str so pyarrow can write them.
         out_df = merged_df.drop(columns=["MPL_colormap"], errors="ignore").copy()
@@ -252,7 +286,15 @@ def main():
             if col in out_df.columns:
                 out_df[col] = out_df[col].astype(str)
         out_df.to_parquet(out_path, index=False)
+        rec.log(f"{experiment_path.name}: wrote {len(out_df)} rows -> {out_path.name}")
         print(f"Wrote {out_path}")
+
+        per_experiment.append({
+            "experiment": experiment_path.name,
+            "status": "ok",
+            "n_images": int(len(out_df)),
+            "n_dapi": int((merged_df["Channel_name"] == "DAPI").sum()),
+        })
 
     # Combine everything into one big table (with an Experiment_name column).
     if all_metadata:
@@ -262,15 +304,30 @@ def main():
         print("No experiments were successfully processed.")
 
     # DAPI samples across all processed experiments.
+    n_dapi_total = 0
     if not combined_df.empty:
         dapi_samples = combined_df[combined_df["Channel_name"] == "DAPI"].copy()
         filepaths = dapi_samples["filepath"].tolist()
+        n_dapi_total = len(filepaths)
 
-        print(f"\nFound {len(filepaths)} DAPI images across all experiments.")
+        print(f"\nFound {n_dapi_total} DAPI images across all experiments.")
         print("Sample filepaths:")
         for filepath in filepaths[:5]:
             print(f" - {filepath}")
 
+    # One overall stage record, with per-experiment summaries nested inside.
+    n_ok = sum(1 for e in per_experiment if e["status"] == "ok")
+    rec.finish(
+        outputs={"image_metadata_dir": str(out_dir)},
+        summary={
+            "experiments_processed": n_ok,
+            "experiments_skipped": len(per_experiment) - n_ok,
+            "total_dapi_images": int(n_dapi_total),
+            "per_experiment": per_experiment,
+        },
+    )
+
+    print(f"\n=== RUN ID: {run_id} (pass to downstream stages with --run-id) ===")
     return combined_df
 
 
