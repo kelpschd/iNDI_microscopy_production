@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import random
+import re
 import socket
 import string
 import subprocess
@@ -33,6 +34,12 @@ from pathlib import Path
 RUN_PREFIX = "run_"
 METADATA_FILENAME = "run_metadata.json"
 LOG_FILENAME = "run.log"
+
+# For array/parallel stages: each task writes its own shard file into these
+# sibling directories instead of touching the shared files (avoids the
+# read-modify-write race on run_metadata.json). A later merge step folds them in.
+METADATA_SHARD_DIR = "run_metadata.d"
+LOG_SHARD_DIR = "run.log.d"
 
 _SUFFIX_ALPHABET = string.ascii_lowercase + string.digits
 
@@ -218,6 +225,121 @@ def log(run_dir: Path, message: str, stage: str | None = None,
         print(line)
 
 
+# --- Sharded (array-safe) metadata + log I/O -------------------------------
+# When many array tasks run one stage concurrently, they must NOT read-modify-
+# write the shared run_metadata.json / run.log (that races and drops records).
+# Instead each task writes its own shard file; merge_shard_records() folds them
+# into the shared files afterward.
+
+def _metadata_shard_dir(run_dir: Path) -> Path:
+    return Path(run_dir) / METADATA_SHARD_DIR
+
+
+def _log_shard_dir(run_dir: Path) -> Path:
+    return Path(run_dir) / LOG_SHARD_DIR
+
+
+def _safe_shard_name(stage: str, shard: str) -> str:
+    """Filesystem-safe '<stage>__<shard>' base name."""
+    safe_shard = re.sub(r"[^A-Za-z0-9._-]", "_", str(shard))
+    return f"{stage}__{safe_shard}"
+
+
+def write_shard_record(run_dir: Path, stage: str, shard: str,
+                       record: dict) -> Path:
+    """Write one stage record to its own shard file (no shared-file contention).
+
+    Safe for concurrent array tasks: each task writes a distinct path. Returns
+    the shard file path.
+    """
+    d = _metadata_shard_dir(run_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{_safe_shard_name(stage, shard)}.json"
+    path.write_text(json.dumps(record, indent=2) + "\n")
+    return path
+
+
+def log_shard(run_dir: Path, stage: str, shard: str, message: str,
+              echo: bool = True) -> None:
+    """Append a timestamped line to this shard's own log file."""
+    d = _log_shard_dir(run_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{_safe_shard_name(stage, shard)}.log"
+    line = f"[{_now_iso()}] [{stage}:{shard}] {message}"
+    with path.open("a") as fh:
+        fh.write(line + "\n")
+    if echo:
+        print(line)
+
+
+def merge_shard_records(run_dir: Path, remove_after: bool = True) -> int:
+    """Fold all shard records/logs into the shared run_metadata.json / run.log.
+
+    - Appends each shard's stage record to run_metadata.json's 'stages'
+      (sorted by start time so the timeline reads naturally).
+    - Appends each shard log file's lines to run.log.
+    - Removes merged shard files unless remove_after=False.
+
+    Idempotent: running it again after a merge is a no-op (shard dirs empty).
+    Returns the number of stage records merged.
+    """
+    run_dir = Path(run_dir)
+    shard_dir = _metadata_shard_dir(run_dir)
+    merged = 0
+
+    # --- metadata ---
+    if shard_dir.is_dir():
+        shard_files = sorted(shard_dir.glob("*.json"))
+        records = []
+        for sf in shard_files:
+            try:
+                records.append(json.loads(sf.read_text()))
+            except json.JSONDecodeError as exc:
+                print(f"[warning] skipping unreadable shard {sf.name}: {exc}")
+
+        if records:
+            mpath = _metadata_path(run_dir)
+            if mpath.exists():
+                doc = json.loads(mpath.read_text())
+            else:
+                doc = {"run_id": None, "created": _now_iso(),
+                       "git": git_state(), "environment": env_state(),
+                       "stages": []}
+            doc.setdefault("stages", []).extend(records)
+            # Keep the stages list ordered by start time when available.
+            doc["stages"].sort(key=lambda r: r.get("started", ""))
+            mpath.write_text(json.dumps(doc, indent=2) + "\n")
+            merged = len(records)
+
+        if remove_after:
+            for sf in shard_files:
+                sf.unlink(missing_ok=True)
+            # Remove the dir if now empty.
+            try:
+                shard_dir.rmdir()
+            except OSError:
+                pass
+
+    # --- logs ---
+    log_dir = _log_shard_dir(run_dir)
+    if log_dir.is_dir():
+        log_files = sorted(log_dir.glob("*.log"))
+        if log_files:
+            with _log_path(run_dir).open("a") as out:
+                for lf in log_files:
+                    out.write(lf.read_text())
+        if remove_after:
+            for lf in log_files:
+                lf.unlink(missing_ok=True)
+            try:
+                log_dir.rmdir()
+            except OSError:
+                pass
+
+    print(f"[merge] folded {merged} shard record(s) into {METADATA_FILENAME}")
+    return merged
+
+
 # --- Stage helper ----------------------------------------------------------
 
 class StageRecorder:
@@ -239,19 +361,27 @@ class StageRecorder:
 
     def __init__(self, run_dir: Path, stage: str, run_id: str,
                  params: dict | None = None, inputs: dict | None = None,
-                 argv: list[str] | None = None):
+                 argv: list[str] | None = None, shard: str | None = None):
         self.run_dir = Path(run_dir)
         self.stage = stage
         self.run_id = run_id
         self.params = params or {}
         self.inputs = inputs or {}
         self.argv = argv if argv is not None else list(sys.argv)
+        self.shard = shard
         self._start = datetime.now(timezone.utc)
-        init_run_metadata(self.run_dir, run_id)
-        self.log(f"stage '{stage}' started")
+        # Sharded (array-task) recorders must NOT init/touch the shared doc;
+        # it already exists from stage 0_, and concurrent init would race.
+        if shard is None:
+            init_run_metadata(self.run_dir, run_id)
+        self.log(f"stage '{stage}' started"
+                 + (f" (shard={shard})" if shard else ""))
 
     def log(self, message: str, echo: bool = True) -> None:
-        log(self.run_dir, message, stage=self.stage, echo=echo)
+        if self.shard is not None:
+            log_shard(self.run_dir, self.stage, self.shard, message, echo=echo)
+        else:
+            log(self.run_dir, message, stage=self.stage, echo=echo)
 
     def finish(self, outputs: dict | None = None,
                summary: dict | None = None, status: str = "ok") -> dict:
@@ -268,7 +398,11 @@ class StageRecorder:
             "outputs": outputs or {},
             "summary": summary or {},
         }
-        append_stage_record(self.run_dir, record)
+        if self.shard is not None:
+            record["shard"] = self.shard
+            write_shard_record(self.run_dir, self.stage, self.shard, record)
+        else:
+            append_stage_record(self.run_dir, record)
         self.log(f"stage '{self.stage}' finished ({record['duration_s']}s, "
                  f"status={status})")
         return record

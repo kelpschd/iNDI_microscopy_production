@@ -1,6 +1,6 @@
 import os
 import re
-import uuid
+import sys
 import time
 import shutil
 import argparse
@@ -22,6 +22,10 @@ from skimage.filters import threshold_triangle, threshold_otsu
 from skimage.feature import graycomatrix, graycoprops
 from skimage.morphology import remove_small_objects, erosion, dilation, opening
 from skimage.morphology import disk as morph_disk
+
+# --- run_utils bootstrap ---------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 try:
     from tqdm import tqdm
@@ -50,9 +54,10 @@ SCRATCH_BASE = f"/lscratch/{SLURM_JOB_ID}" if SLURM_JOB_ID else None
 # Raw imaging tree (experiment folders live directly under here).
 DEFAULT_SRC_BASE = Path("/data/CARDPB2/iNDI/Production/AbPanel1")
 
-# Default input/output dirs (chain from the filtering script).
-DEFAULT_INPUT_DIR = Path("./output/nuclei_filtered")
-DEFAULT_OUTPUT_DIR = Path("./output/organelle_features")
+# Stage name + the sub-dirs this stage reads from / writes to inside a run.
+STAGE = "organelle_segmentation"
+INPUT_STAGE_DIR = "nuclei_filtered"
+OUTPUT_STAGE_DIR = "organelle_features"
 
 # Harmony XML namespace.
 NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
@@ -104,6 +109,32 @@ GLCM_PROPS = ("contrast", "dissimilarity", "homogeneity",
 
 # Granularity: morphological opening spectrum. One value per radius.
 GRANULARITY_RADII = (1, 2, 4, 8, 16)
+
+
+def collect_params():
+    """Full config snapshot recorded in run_metadata.json for this stage.
+
+    Captures the segmenter set, panel/stain design, and every feature-extraction
+    knob so that each (re-)run records exactly which features were computed and
+    how. This is what makes feature-iteration self-documenting.
+    """
+    return {
+        "roi_radius": ROI_RADIUS,
+        "selected_only": SELECTED_ONLY,
+        "segmenters": sorted(SEGMENTERS_BY_STRUCTURE.keys()),
+        "panel_design": PANEL_DESIGN,
+        "antigens": ANTIGENS,
+        "shape_props": list(SHAPE_PROPS),
+        "intensity_props": list(INTENSITY_PROPS),
+        "agg_stats": list(AGG_STATS.keys()),
+        "glcm": {
+            "levels": GLCM_LEVELS,
+            "distances": list(GLCM_DISTANCES),
+            "angles": list(GLCM_ANGLES),
+            "props": list(GLCM_PROPS),
+        },
+        "granularity_radii": list(GRANULARITY_RADII),
+    }
 
 
 # --- Segmenters (unchanged logic; now applied to the whole frame) ---------
@@ -649,11 +680,12 @@ def stage_to_scratch(src_images_dir, mid):
 
 def experiment_name_from_parquet(parquet_path):
     stem = parquet_path.stem
-    return stem.split("_nuclei_filtered_")[0] if "_nuclei_filtered_" in stem else stem
+    # Filenames are now '<exp>_nuclei_filtered.parquet' (run dir carries date).
+    return stem.split("_nuclei_filtered")[0] if "_nuclei_filtered" in stem else stem
 
 
 def discover_filtered_parquets(input_dir, selected=None):
-    all_parquets = sorted(input_dir.glob("*_nuclei_filtered_*.parquet"))
+    all_parquets = sorted(input_dir.glob("*_nuclei_filtered*.parquet"))
     if selected is None:
         return all_parquets
     chosen = []
@@ -666,8 +698,8 @@ def discover_filtered_parquets(input_dir, selected=None):
     return chosen
 
 
-def process_filtered_parquet(parquet_path, src_base, output_dir, today,
-                             panel, radius, n_workers):
+def process_filtered_parquet(parquet_path, src_base, output_dir, version_stamp,
+                             panel, radius, n_workers, rec):
     nuclei_features = pd.read_parquet(parquet_path)
     exp_name = experiment_name_from_parquet(parquet_path)
 
@@ -685,6 +717,8 @@ def process_filtered_parquet(parquet_path, src_base, output_dir, today,
 
     print(f"\n{exp_name}: {len(nuclei_features)} selected nuclei "
           f"across {nuclei_features['image_name'].nunique()} frame(s)")
+    rec.log(f"{exp_name}: {len(nuclei_features)} selected nuclei, "
+            f"{nuclei_features['image_name'].nunique()} frame(s)")
 
     t0 = time.time()
     samplesheet = build_samplesheet(experiment_path, panel)
@@ -716,19 +750,32 @@ def process_filtered_parquet(parquet_path, src_base, output_dir, today,
         print(f"[warning] {exp_name} produced no organelle rows.")
         return None
 
-    out_path = output_dir / f"{exp_name}_organelle_features_{today}.parquet"
+    # Versioned output: one stamp per 3_ invocation, so re-runs don't overwrite
+    # and files from the same run share a stamp.
+    out_path = output_dir / f"{exp_name}_organelle_features__{version_stamp}.parquet"
     result.to_parquet(out_path, index=False)
 
     n_rows = len(result)
     n_nuc = result["Nucleus_ID"].nunique()
+    n_feature_cols = result.shape[1]
     print(f"\n--- {exp_name} summary ---")
     print(f"  Organelle feature rows:    {n_rows}")
     print(f"  Nuclei with organelles:    {n_nuc}")
+    print(f"  Feature columns:           {n_feature_cols}")
     for structure, grp in result.groupby("Structure"):
         print(f"    {structure:<14} {len(grp)} rows")
     print(f"  Wrote -> {out_path}")
+    rec.log(f"{exp_name}: {n_rows} rows, {n_nuc} nuclei, "
+            f"{n_feature_cols} cols -> {out_path.name}")
 
-    return {"exp_name": exp_name, "n_rows": n_rows, "n_nuc": n_nuc}
+    return {
+        "exp_name": exp_name,
+        "n_rows": n_rows,
+        "n_nuc": n_nuc,
+        "n_feature_cols": int(n_feature_cols),
+        "output_file": out_path.name,
+        "per_structure": {s: int(len(g)) for s, g in result.groupby("Structure")},
+    }
 
 
 # --- Main ------------------------------------------------------------------
@@ -740,16 +787,8 @@ def parse_args():
                     "organelle-feature parquets."
     )
     parser.add_argument(
-        "input_dir", nargs="?", type=Path, default=DEFAULT_INPUT_DIR,
-        help=f"Directory of filtered nuclei parquets (default: {DEFAULT_INPUT_DIR}).",
-    )
-    parser.add_argument(
         "-e", "--experiments", nargs="+", default=None, metavar="NAME",
         help="Specific experiment names (matched against parquet prefixes).",
-    )
-    parser.add_argument(
-        "-o", "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-        help=f"Output directory (default: {DEFAULT_OUTPUT_DIR}).",
     )
     parser.add_argument(
         "-b", "--src-base", type=Path, default=DEFAULT_SRC_BASE,
@@ -767,41 +806,116 @@ def parse_args():
         "-w", "--workers", type=int, default=N_WORKERS,
         help=f"Worker processes (default: {N_WORKERS}, from SLURM allocation).",
     )
+    parser.add_argument(
+        "--version-stamp", default=None, metavar="YYYYMMDD_HHMMSS",
+        help="Shared version stamp for output filenames. If omitted, one is "
+             "generated at startup. Pass the SAME stamp to every task of an "
+             "array so all its outputs share one version.",
+    )
+    parser.add_argument(
+        "--merge-only", action="store_true",
+        help="Do not segment. Fold this run's per-experiment metadata/log "
+             "shards into run_metadata.json / run.log, then exit. Run this "
+             "once after an array of per-experiment tasks completes.",
+    )
+    # --output-root + --run-id (required here: reuse the run minted by 0_).
+    ru.add_run_args(parser, mints_run_id=False)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if not args.input_dir.is_dir():
-        raise SystemExit(f"[error] input dir is not a directory: {args.input_dir}")
+    # Resolve the existing run dir (errors clearly if the run ID is wrong).
+    run_dir = ru.resolve_run_dir(args.output_root, args.run_id)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
+    # --merge-only: consolidate array shards and exit. No segmentation.
+    if args.merge_only:
+        print(f"\n=== RUN ID: {args.run_id} | merge-only ===")
+        n = ru.merge_shard_records(run_dir)
+        print(f"Merged {n} shard record(s) into the run metadata.")
+        return
 
-    parquets = discover_filtered_parquets(args.input_dir, args.experiments)
+    input_dir = ru.stage_dir(run_dir, INPUT_STAGE_DIR)
+    output_dir = ru.stage_dir(run_dir, OUTPUT_STAGE_DIR)
+
+    # One version stamp per invocation (or shared across an array via the flag)
+    # -> versioned, non-overwriting outputs.
+    version_stamp = args.version_stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Sharded (array-safe) recording when exactly one experiment is requested;
+    # that's how the job array invokes this (-e "$EXP"). Zero or multiple
+    # experiments -> normal shared writer (a sequential single-process run).
+    shard = (
+        args.experiments[0]
+        if args.experiments and len(args.experiments) == 1
+        else None
+    )
+
+    rec = ru.StageRecorder(
+        run_dir, stage=STAGE, run_id=args.run_id,
+        params=collect_params(),
+        inputs={
+            "input_dir": str(input_dir),
+            "src_base": str(args.src_base),
+            "panel": args.panel,
+            "radius": args.radius,
+            "workers": args.workers,
+            "version_stamp": version_stamp,
+            "experiments_requested": args.experiments or "ALL",
+        },
+        shard=shard,
+    )
+    print(f"\n=== RUN ID: {args.run_id} ===")
+    print(f"=== run dir: {run_dir} ===")
+    print(f"=== version stamp: {version_stamp} ===")
+    if shard:
+        print(f"=== sharded record: {shard} ===")
+    print()
+    rec.log(f"version stamp {version_stamp}")
+
+    parquets = discover_filtered_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} filtered parquet(s) to process.")
     print(f"Workers: {args.workers} | Panel: {args.panel} | ROI radius: {args.radius}")
+    rec.log(f"found {len(parquets)} filtered parquet(s); "
+            f"workers={args.workers} panel={args.panel} radius={args.radius}")
 
     all_stats = []
     for parquet_path in parquets:
         stats = process_filtered_parquet(
-            parquet_path, args.src_base, args.output_dir, today,
-            args.panel, args.radius, args.workers,
+            parquet_path, args.src_base, output_dir, version_stamp,
+            args.panel, args.radius, args.workers, rec,
         )
         if stats is not None:
             all_stats.append(stats)
 
+    total_rows = sum(s["n_rows"] for s in all_stats)
+    total_nuc = sum(s["n_nuc"] for s in all_stats)
+
     if all_stats:
-        total_rows = sum(s["n_rows"] for s in all_stats)
-        total_nuc = sum(s["n_nuc"] for s in all_stats)
         print("\n" + "=" * 40)
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
         print(f"  Organelle feature rows:    {total_rows}")
-        print(f"  Nuclei with organelles:    {total_nuc}")
+        print(f"  Total nuclei measured:     {total_nuc}")
         print("=" * 40)
+
+    rec.finish(
+        outputs={
+            "organelle_features_dir": str(output_dir),
+            "version_stamp": version_stamp,
+            "output_files": [s["output_file"] for s in all_stats],
+        },
+        summary={
+            "experiments_processed": len(all_stats),
+            "organelle_feature_rows": total_rows,
+            "nuclei_measured": total_nuc,
+            "per_experiment": all_stats,
+        },
+    )
+
+    print(f"\n=== RUN ID: {args.run_id} | version: {version_stamp} ===")
 
 
 if __name__ == "__main__":
-    main()</document_content>
+    main()
