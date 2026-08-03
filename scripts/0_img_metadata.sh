@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=indi_img_metadata
-#SBATCH --output=logs/indi_img_metadata%j.out
-#SBATCH --error=logs/indi_img_metadata%j.err
+#SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata%j.out
+#SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata%j.err
 #SBATCH --time=04:00:00                
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=32G                      
@@ -15,4 +15,4 @@ conda activate indi_project
 
 python /data/kelpschdj/iNDI/Production/scripts/0_img_metadata.py \
     "/data/CARDPB2/iNDI/Production/AbPanel1" \
-    -o "/data/kelpschdj/iNDI/Production/Nucleus_segmentation/output/image_metadata"
+    --output-root /data/kelpschdj/iNDI/Production/outputs
