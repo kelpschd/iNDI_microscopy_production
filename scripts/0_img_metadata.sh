@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=indi_img_metadata
-#SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata%j.out
-#SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata%j.err
+#SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata_%j.out
+#SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_img_metadata_%j.err
 #SBATCH --time=04:00:00                
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=32G                      
