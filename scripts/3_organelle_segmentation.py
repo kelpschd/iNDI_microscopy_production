@@ -440,6 +440,9 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             "channel_filename": row["filename"],
             "Structure": structure,
             "Stain": row.get("Stain"),
+            # Per-frame nucleus label from segmentation. NOTE: unique only
+            # within a frame; join back to the nucleus tables on
+            # (DAPI_filename, Nucleus_ID), not Nucleus_ID alone.
             "Nucleus_ID": int(nucleus_ids[roi_idx]),
             # ROI-level (count-level) metrics
             "area_px": area_px,
@@ -682,11 +685,14 @@ def process_filtered_parquet(parquet_path, src_base, output_dir, version_stamp,
     result.to_parquet(out_path, index=False)
 
     n_rows = len(result)
-    n_nuc = result["Nucleus_ID"].nunique()
+    # NOTE: Nucleus_ID is a per-frame label, so nunique() is the max distinct
+    # labels seen, NOT the true nucleus count. Count unique (frame, label)
+    # pairs for an accurate per-experiment nucleus tally.
+    n_nuc = result.groupby(["DAPI_filename", "Nucleus_ID"]).ngroups
     n_feature_cols = result.shape[1]
     print(f"\n--- {exp_name} summary ---")
     print(f"  Organelle feature rows:    {n_rows}")
-    print(f"  Nuclei with organelles:    {n_nuc}")
+    print(f"  Distinct nuclei measured:  {n_nuc}")
     print(f"  Feature columns:           {n_feature_cols}")
     for structure, grp in result.groupby("Structure"):
         print(f"    {structure:<14} {len(grp)} rows")
@@ -823,7 +829,7 @@ def main():
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
         print(f"  Organelle feature rows:    {total_rows}")
-        print(f"  Total nuclei measured:     {total_nuc}")
+        print(f"  Distinct nuclei measured:  {total_nuc}")
         print("=" * 40)
 
     rec.finish(
