@@ -64,8 +64,6 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 # 2) After the array finishes, fold the per-experiment shards into the run
 #    metadata (run once, not in parallel):
 #
-#      python 3_organelle_segmentation.py \
-#          --run-id "$RUN_ID" \
-#          --output-root /data/kelpschdj/iNDI/Production/outputs \
-#          --merge-only
+#      python 3_organelle_segmentation.py --run-id 20260803_124616_6otz --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
+#
 #############################################################################
