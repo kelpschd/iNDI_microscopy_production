@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=indi_qc_overlays
-#SBATCH --output=logs/indi_qc_overlays%j.out
-#SBATCH --error=logs/indi_qc_overlays%j.err
+#SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_qc_overlays_%j.out
+#SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_qc_overlays_%j.err
 #SBATCH --time=02:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -17,13 +17,13 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-FILT_DIR="/data/kelpschdj/iNDI/Production/Nucleus_segmentation/output/nuclei_filtered"
-OUT_DIR="/data/kelpschdj/iNDI/Production/Organelle_segmentation/output/qc"
+RUN_ID="20260803_124616_6otz"
+OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
 SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
 
 python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
-    "$FILT_DIR" \
-    -o "$OUT_DIR" \
+    --run-id "$RUN_ID" \
+    --output-root "$OUTPUT_ROOT" \
     -b "$SRC_BASE" \
     -p 1 \
     -n 5

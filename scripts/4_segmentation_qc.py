@@ -1,4 +1,4 @@
-import os
+import sys
 import random
 import argparse
 from pathlib import Path
@@ -12,6 +12,10 @@ matplotlib.use("Agg")  # headless: write PNGs, no display
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from skimage.measure import label
+
+# --- run_utils bootstrap ---------------------------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_utils as ru  # noqa: E402
 
 # Reuse the real segmentation + assignment logic so QC can't drift from the
 # pipeline. These come straight from script 3.
@@ -27,10 +31,24 @@ DEFAULT_N_FRAMES = 5              # random frames to QC per experiment
 QC_MAX_TILES_PER_STRUCT = 8       # tiles in the gallery (matches original)
 SELECTED_ONLY = True
 
-DEFAULT_INPUT_DIR = Path("./output/nuclei_filtered")
 DEFAULT_SRC_BASE = Path("/data/CARDPB2/iNDI/Production/AbPanel1")
-DEFAULT_OUTPUT_DIR = Path("./output/qc")
 DEFAULT_PANEL = 1
+
+# Stage name + the sub-dirs this stage reads from / writes to inside a run.
+STAGE = "segmentation_qc"
+INPUT_STAGE_DIR = "nuclei_filtered"
+OUTPUT_STAGE_DIR = "qc"
+
+
+def collect_params():
+    """Config recorded in run_metadata.json for this stage."""
+    return {
+        "roi_radius": ROI_RADIUS,
+        "n_frames": DEFAULT_N_FRAMES,
+        "max_tiles_per_struct": QC_MAX_TILES_PER_STRUCT,
+        "selected_only": SELECTED_ONLY,
+        "segmenters": sorted(SEGMENTERS_BY_STRUCTURE.keys()),
+    }
 
 
 # --- Rendering (mirrors the original notebook QC) --------------------------
@@ -178,11 +196,12 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
 
 def experiment_name_from_parquet(parquet_path):
     stem = parquet_path.stem
-    return stem.split("_nuclei_filtered_")[0] if "_nuclei_filtered_" in stem else stem
+    # Filenames are now '<exp>_nuclei_filtered.parquet' (run dir carries date).
+    return stem.split("_nuclei_filtered")[0] if "_nuclei_filtered" in stem else stem
 
 
 def discover_filtered_parquets(input_dir, selected=None):
-    all_parquets = sorted(input_dir.glob("*_nuclei_filtered_*.parquet"))
+    all_parquets = sorted(input_dir.glob("*_nuclei_filtered*.parquet"))
     if selected is None:
         return all_parquets
     chosen = []
@@ -203,7 +222,7 @@ def _dapi_row(site_df):
 
 
 def qc_experiment(parquet_path, src_base, output_dir, panel, radius,
-                  n_frames, seed):
+                  n_frames, seed, rec):
     nuclei_features = pd.read_parquet(parquet_path)
     exp_name = experiment_name_from_parquet(parquet_path)
 
@@ -235,6 +254,7 @@ def qc_experiment(parquet_path, src_base, output_dir, panel, radius,
 
     print(f"\n{exp_name}: QC on {len(sample)} random frame(s) "
           f"(of {len(frames)} with selected nuclei)")
+    rec.log(f"{exp_name}: QC on {len(sample)} of {len(frames)} frame(s)")
 
     site_keys = ["Row", "Column", "Frame", "Plane", "Time"]
     total_written = 0
@@ -267,6 +287,7 @@ def qc_experiment(parquet_path, src_base, output_dir, panel, radius,
         print(f"  {frame_name} -> {written} figure(s)")
 
     print(f"  wrote {total_written} PNG(s) to {exp_out}")
+    rec.log(f"{exp_name}: wrote {total_written} PNG(s)")
     return total_written
 
 
@@ -278,12 +299,8 @@ def parse_args():
                     "per-ROI tile gallery, matching the original notebook QC) "
                     "for random frames from filtered experiments."
     )
-    parser.add_argument("input_dir", nargs="?", type=Path, default=DEFAULT_INPUT_DIR,
-                        help=f"Filtered nuclei parquet dir (default: {DEFAULT_INPUT_DIR}).")
     parser.add_argument("-e", "--experiments", nargs="+", default=None, metavar="NAME",
                         help="Specific experiment names (parquet prefixes).")
-    parser.add_argument("-o", "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
-                        help=f"QC output dir (default: {DEFAULT_OUTPUT_DIR}).")
     parser.add_argument("-b", "--src-base", type=Path, default=DEFAULT_SRC_BASE,
                         help=f"Raw experiment base path (default: {DEFAULT_SRC_BASE}).")
     parser.add_argument("-p", "--panel", type=int, default=DEFAULT_PANEL, choices=[1, 2])
@@ -292,28 +309,64 @@ def parse_args():
                         help=f"Random frames per experiment (default: {DEFAULT_N_FRAMES}).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for frame sampling (default: 42).")
+    # --output-root + --run-id (required here: reuse the run minted by 0_).
+    ru.add_run_args(parser, mints_run_id=False)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if not args.input_dir.is_dir():
-        raise SystemExit(f"[error] input dir is not a directory: {args.input_dir}")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    parquets = discover_filtered_parquets(args.input_dir, args.experiments)
+    # Resolve the existing run dir (errors clearly if the run ID is wrong).
+    run_dir = ru.resolve_run_dir(args.output_root, args.run_id)
+    input_dir = ru.stage_dir(run_dir, INPUT_STAGE_DIR)
+    output_dir = ru.stage_dir(run_dir, OUTPUT_STAGE_DIR)
+
+    rec = ru.StageRecorder(
+        run_dir, stage=STAGE, run_id=args.run_id,
+        params=collect_params(),
+        inputs={
+            "input_dir": str(input_dir),
+            "src_base": str(args.src_base),
+            "panel": args.panel,
+            "radius": args.radius,
+            "n_frames": args.n_frames,
+            "seed": args.seed,
+            "experiments_requested": args.experiments or "ALL",
+        },
+    )
+    print(f"\n=== RUN ID: {args.run_id} ===")
+    print(f"=== run dir: {run_dir} ===\n")
+
+    parquets = discover_filtered_parquets(input_dir, args.experiments)
     print(f"Found {len(parquets)} filtered parquet(s) to QC.")
+    rec.log(f"found {len(parquets)} filtered parquet(s) in {input_dir}")
 
+    per_experiment = []
     grand_total = 0
     for parquet_path in parquets:
-        grand_total += qc_experiment(
-            parquet_path, args.src_base, args.output_dir, args.panel,
-            args.radius, args.n_frames, args.seed,
+        exp_name = experiment_name_from_parquet(parquet_path)
+        written = qc_experiment(
+            parquet_path, args.src_base, output_dir, args.panel,
+            args.radius, args.n_frames, args.seed, rec,
         )
+        grand_total += written
+        per_experiment.append({"experiment": exp_name, "pngs_written": written})
 
     print("\n" + "=" * 40)
     print(f"QC COMPLETE - wrote {grand_total} PNG(s) total")
     print("=" * 40)
+
+    rec.finish(
+        outputs={"qc_dir": str(output_dir)},
+        summary={
+            "experiments_qcd": len([e for e in per_experiment if e["pngs_written"]]),
+            "total_pngs": grand_total,
+            "per_experiment": per_experiment,
+        },
+    )
+
+    print(f"\n=== RUN ID: {args.run_id} ===")
 
 
 if __name__ == "__main__":
