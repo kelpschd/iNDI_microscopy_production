@@ -1,8 +1,8 @@
 # iNDI Organelle Morphology Pipeline
 
-A staged image-analysis pipeline for high-content microscopy of iNDI (iPSC-derived NGN2-Induced) cells. It extracts imaging metadata, segments nuclei, defines and filters per-nucleus ROIs, segments organelles within those ROIs, and generates QC overlays.
+A staged image-analysis pipeline for high-content microscopy of iPSC-derived neurons. It extracts imaging metadata, segments nuclei, defines and filters per-nucleus ROIs, segments organelles within those ROIs, and generates QC overlays.
 
-The pipeline is built around **immunofluorescence antibody panels** imaged on a PerkinElmer/Revvity Phenix (Harmony) system. Each stage reads the previous stage's output and writes into a shared, per-run output directory, recording its parameters and a summary into the run metadata so that every run is self-documenting and reproducible.
+The pipeline is built around **immunofluorescence antibody panels** imaged on Revvity Opera Phenix system. Each stage reads the previous stage's output and writes into a shared, per-run output directory, recording its parameters and a summary into the run metadata so that every run is self-documenting and reproducible.
 
 ## Pipeline overview
 
@@ -68,15 +68,13 @@ Stage 3 runs as a **job array**, one task per experiment, and requires a two-ste
 Walks each experiment folder, parses the experiment-level and index Harmony XML (measurement ID, date, plate, resolution, channel definitions), enumerates `.tiff` files, and parses `rNcNfNpN-chNtN` filenames into Row/Column/Frame/Plane/ChannelID/Time. Assigns a pseudocolor per channel and writes one metadata parquet per experiment. This is the stage that mints the run ID.
 
 ### 1 — Nucleus segmentation (`1_nucleus_segmentation.py`)
-Segments nuclei on the **DAPI** channel using a fitted-Gaussian contrast stretch, a triangle/median low-level threshold, a per-object Otsu high-level threshold, hole-filling, and small-object removal. Frames below a contrast cutoff are skipped via a full-frame contrast gate. Extracts per-nucleus region properties and writes a features parquet plus a per-image QC parquet. Uses Dask for parallelism (default `processes` scheduler).
+Segments nuclei on the **DAPI** channel using a fitted-Gaussian contrast stretch, a triangle/median low-level threshold, a per-object Otsu high-level threshold, hole-filling, and small-object removal (modified from Allen Cell Segmenter). Frames below a contrast cutoff are skipped via a full-frame contrast gate. Extracts per-nucleus region properties and writes a features parquet plus a per-image QC parquet. Uses Dask for parallelism (default `processes` scheduler).
 
 ### 2 — ROI filtering (`2_roi_filtering.py`)
-Defines a fixed-radius circular ROI centered on each nucleus centroid and applies three checks: **area** (upper cutoff), **edge** (ROI must not extend past the frame border), and **overlap** (fails ROIs overlapping a neighbor by more than a set fraction of ROI area). Combines these with the upstream `contrast_check` into a single `selected` boolean. Frame dimensions are read from an image, overridable with `--frame-size HxW`.
+Defines a fixed-radius circular ROI centered on each nucleus centroid and applies three checks: **area** (upper cutoff), **edge** (ROI must not extend past the frame border), and **overlap** (fails ROIs overlapping a neighbor by more than a set fraction of ROI area; 5%). Combines these with the upstream `contrast_check` into a single `selected` boolean. Frame dimensions are read from an image, overridable with `--frame-size HxW`.
 
 ### 3 — Organelle segmentation (`3_organelle_segmentation.py`)
-For each selected nucleus's ROI, segments organelle channels across the whole frame using structure-specific segmenters (Golgi, Lysosome, Endosome, Mitochondria), then assigns objects to ROIs under a **full-containment, nearest-centroid** rule. Aggregates per-object shape/intensity/radial-distance features into per-nucleus summary statistics. Which stains map to which structures is set by `--panel` (1 or 2).
-
-**Important:** `Nucleus_ID` is a **per-frame** label. Join back to the nucleus tables on `(DAPI_filename, Nucleus_ID)`, not `Nucleus_ID` alone.
+For each selected nucleus's ROI, segments organelle channels across the whole frame using structure-specific segmenters (Golgi, Lysosome, Endosome, Mitochondria; each modified from Allen Cell Segmenter), then assigns objects to ROIs under a **full-containment, nearest-centroid** rule. Aggregates per-object shape/intensity/radial-distance features into per-nucleus summary statistics. Which stains map to which structures is set by `--panel` (1 or 2).
 
 Outputs are **version-stamped** (`..._organelle_features__<YYYYMMDD_HHMMSS>.parquet`) so re-runs don't overwrite. Pass a shared `--version-stamp` to all array tasks so they share one stamp.
 
@@ -95,7 +93,7 @@ python scripts/3_organelle_segmentation.py --run-id <RUN_ID> \
 ```
 
 ### 4 — Segmentation QC (`4_segmentation_qc.py`)
-Imports the **real** segmenters and ROI-assignment logic from stage 3 (so QC can't drift from the pipeline) and renders, for a random sample of frames per experiment, a three-panel figure (DAPI | channel | assigned-segmentation overlay) and a per-ROI tile gallery. `-n` controls the number of random frames; `--seed` makes the sampling reproducible.
+Imports the segmenters and ROI-assignment logic from stage 3 and renders, for a random sample of frames per experiment, a three-panel figure (DAPI | channel | assigned-segmentation overlay) and a per-ROI tile gallery. `-n` controls the number of random frames; `--seed` makes the sampling reproducible.
 
 ## Panels
 
