@@ -4,7 +4,7 @@
 #SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_organelle_seg_%A_%a.err
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+#SBATCH --mem=48G
 #SBATCH --gres=lscratch:500
 #SBATCH --partition=norm
 
@@ -33,7 +33,7 @@ mapfile -t EXPERIMENTS < <(
 
 EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
 if [[ -z "$EXP" ]]; then
-    echo "No experiment for array index $SLURM_ARRAY_ dTASK_ID" >&2
+    echo "No experiment for array index $SLURM_ARRAY_TASK_ID" >&2
     exit 1
 fi
 
