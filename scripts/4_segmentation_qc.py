@@ -23,6 +23,10 @@ _seg = import_module("3_organelle_segmentation")
 SEGMENTERS_BY_STRUCTURE = _seg.SEGMENTERS_BY_STRUCTURE
 assign_objects_to_rois = _seg.assign_objects_to_rois
 build_samplesheet = _seg.build_samplesheet
+# Same per-stain contrast gate as script 3, so QC skips exactly the channels
+# the pipeline would skip.
+CONTRAST_CUTOFF_BY_STAIN = _seg.CONTRAST_CUTOFF_BY_STAIN
+CONTRAST_CUTOFF_DEFAULT = _seg.CONTRAST_CUTOFF_DEFAULT
 
 # --- Configuration ---------------------------------------------------------
 
@@ -48,6 +52,8 @@ def collect_params():
         "max_tiles_per_struct": QC_MAX_TILES_PER_STRUCT,
         "selected_only": SELECTED_ONLY,
         "segmenters": sorted(SEGMENTERS_BY_STRUCTURE.keys()),
+        "contrast_cutoff_by_stain": CONTRAST_CUTOFF_BY_STAIN,
+        "contrast_cutoff_default": CONTRAST_CUTOFF_DEFAULT,
     }
 
 
@@ -111,6 +117,10 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
     """Segment each structure on the WHOLE frame, then build the same two QC
     figures as the original notebook (three-panel + tile gallery).
 
+    A per-stain contrast gate (identical to script 3) runs first: channels
+    whose raw-frame std falls below their cutoff are skipped entirely, so QC
+    never renders a mask for a channel the pipeline would have dropped.
+
     The mask shown is the whole-frame segmentation (the current pipeline
     behavior); tiles are crops of that mask around each ROI, so the gallery
     reflects what actually gets assigned rather than per-tile re-segmentation.
@@ -136,6 +146,16 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
         ch_img = tifffile.imread(row["filepath"])
         if ch_img.ndim == 3 and ch_img.shape[0] == 1:
             ch_img = ch_img[0]
+
+        # Contrast gate (per stain) — identical to script 3. Skip figures for
+        # channels the pipeline would drop, so QC reflects real behavior.
+        frame_std = float(ch_img.astype(np.float64).std())
+        stain = str(row.get("Stain", "")).strip()
+        cutoff = CONTRAST_CUTOFF_BY_STAIN.get(stain, CONTRAST_CUTOFF_DEFAULT)
+        if frame_std < cutoff:
+            print(f"    [contrast-fail] {structure} ({stain}) "
+                  f"std={frame_std:.1f} < {cutoff} -> skipped")
+            continue
 
         # whole-frame segmentation (current pipeline behavior)
         global_seg = seg_fn(ch_img)
