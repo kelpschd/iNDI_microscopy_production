@@ -76,6 +76,23 @@ PANEL_DESIGN = {
     2: {"DAPI": "DAPI", "Alexa 488": "RAB11A", "Alexa 568": "GM130", "Alexa 647": "TUJ1"},
 }
 
+# --- Contrast QC -----------------------------------------------------------
+
+# Per-stain full-frame contrast cutoffs (raw-frame std, matching the DAPI
+# gate in 1_nucleus_segmentation.py). A channel whose frame std falls below
+# its cutoff is skipped (not segmented) and emits a single marker row so the
+# failure is visible downstream. Stains not listed use CONTRAST_CUTOFF_DEFAULT.
+CONTRAST_CUTOFF_BY_STAIN = {
+    "DAPI":   100,
+    "TOMM20": 20,
+    "EEA1":   20,
+    "LAMP1":  20,
+    "RAB11A": 20,
+    "GM130":  20,
+    "TUJ1":   20,
+}
+CONTRAST_CUTOFF_DEFAULT = 100
+
 # --- Per-object feature aggregation ---------------------------------------
 
 # Per-object shape props to measure with regionprops_table.
@@ -113,6 +130,8 @@ def collect_params():
         "segmenters": sorted(SEGMENTERS_BY_STRUCTURE.keys()),
         "panel_design": PANEL_DESIGN,
         "antigens": ANTIGENS,
+        "contrast_cutoff_by_stain": CONTRAST_CUTOFF_BY_STAIN,
+        "contrast_cutoff_default": CONTRAST_CUTOFF_DEFAULT,
         "shape_props": list(SHAPE_PROPS),
         "intensity_props": list(INTENSITY_PROPS),
         "agg_stats": list(AGG_STATS.keys()),
@@ -362,15 +381,52 @@ def _radial_distances(prop_table, keep_mask, roi_center_yx):
     return np.sqrt((cy - ry) ** 2 + (cx - rx) ** 2)
 
 
+def _contrast_fail_row(structure, frame_std, site_meta, row):
+    """A single marker row for a channel that failed the contrast gate.
+
+    Carries identifying metadata and the QC fields, but no feature columns
+    (they stay absent -> NaN on read). Nucleus_ID is None so these rows never
+    collide with real per-nucleus rows and are trivially filterable via
+    `contrast_check == "fail"`.
+    """
+    return {
+        "Measurement_ID": site_meta.get("Measurement_ID"),
+        "subdirectory": row.get("subdirectory"),
+        "Row": row.get("Row"), "Column": row.get("Column"),
+        "Frame": row.get("Frame"), "Plane": row.get("Plane"),
+        "Time": row.get("Time"),
+        "DAPI_filename": site_meta.get("dapi_filename"),
+        "channel_filename": row["filename"],
+        "Structure": structure,
+        "Stain": row.get("Stain"),
+        "Nucleus_ID": None,
+        "frame_std": frame_std,
+        "contrast_check": "fail",
+    }
+
+
 def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
                               nucleus_ids, radius, site_meta, row):
     """Segment one channel across the whole frame, assign objects to ROIs,
     and return per-nucleus organelle feature rows.
 
+    A per-stain full-frame contrast gate runs first: channels whose raw-frame
+    std falls below their cutoff are not segmented, and a single marker row is
+    returned so the failure is recorded (distinct from a channel that
+    segmented fine but found no organelles). Passing rows record `frame_std`
+    and `contrast_check == "pass"` so cutoffs can be tuned empirically.
+
     Per-object shape/intensity and radial distance are summarized across each
     ROI's objects; texture and granularity are computed once per ROI over its
     assigned-object region.
     """
+    # --- Contrast gate (per stain) ---
+    frame_std = float(ch_img.astype(np.float64).std())
+    stain = str(row.get("Stain", "")).strip()
+    cutoff = CONTRAST_CUTOFF_BY_STAIN.get(stain, CONTRAST_CUTOFF_DEFAULT)
+    if frame_std < cutoff:
+        return [_contrast_fail_row(structure, frame_std, site_meta, row)]
+
     mask = seg_fn(ch_img)
     obj_labels = label(mask, connectivity=1)
     if obj_labels.max() == 0:
@@ -444,6 +500,9 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             # within a frame; join back to the nucleus tables on
             # (DAPI_filename, Nucleus_ID), not Nucleus_ID alone.
             "Nucleus_ID": int(nucleus_ids[roi_idx]),
+            # contrast QC (frame-level; same value for every row from this frame)
+            "frame_std": frame_std,
+            "contrast_check": "pass",
             # ROI-level (count-level) metrics
             "area_px": area_px,
             "organelle_count": count_obj,
@@ -684,29 +743,41 @@ def process_filtered_parquet(parquet_path, src_base, output_dir, version_stamp,
     out_path = output_dir / f"{exp_name}_organelle_features__{version_stamp}.parquet"
     result.to_parquet(out_path, index=False)
 
+    # Split pass/fail so the tally and summary reflect real measurements.
+    if "contrast_check" in result.columns:
+        pass_rows = result[result["contrast_check"] != "fail"]
+        n_contrast_fail = int((result["contrast_check"] == "fail").sum())
+    else:
+        pass_rows = result
+        n_contrast_fail = 0
+
     n_rows = len(result)
     # NOTE: Nucleus_ID is a per-frame label, so nunique() is the max distinct
     # labels seen, NOT the true nucleus count. Count unique (frame, label)
-    # pairs for an accurate per-experiment nucleus tally.
-    n_nuc = result.groupby(["DAPI_filename", "Nucleus_ID"]).ngroups
+    # pairs for an accurate per-experiment nucleus tally. Exclude contrast-fail
+    # marker rows (Nucleus_ID is None) so they don't form a spurious group.
+    n_nuc = pass_rows.groupby(["DAPI_filename", "Nucleus_ID"]).ngroups
     n_feature_cols = result.shape[1]
     print(f"\n--- {exp_name} summary ---")
-    print(f"  Organelle feature rows:    {n_rows}")
+    print(f"  Organelle feature rows:    {len(pass_rows)}")
+    print(f"  Contrast-fail channels:    {n_contrast_fail}")
     print(f"  Distinct nuclei measured:  {n_nuc}")
     print(f"  Feature columns:           {n_feature_cols}")
-    for structure, grp in result.groupby("Structure"):
+    for structure, grp in pass_rows.groupby("Structure"):
         print(f"    {structure:<14} {len(grp)} rows")
     print(f"  Wrote -> {out_path}")
-    rec.log(f"{exp_name}: {n_rows} rows, {n_nuc} nuclei, "
+    rec.log(f"{exp_name}: {len(pass_rows)} rows, {n_nuc} nuclei, "
+            f"{n_contrast_fail} contrast-fail, "
             f"{n_feature_cols} cols -> {out_path.name}")
 
     return {
         "exp_name": exp_name,
-        "n_rows": n_rows,
+        "n_rows": len(pass_rows),
+        "n_contrast_fail": n_contrast_fail,
         "n_nuc": n_nuc,
         "n_feature_cols": int(n_feature_cols),
         "output_file": out_path.name,
-        "per_structure": {s: int(len(g)) for s, g in result.groupby("Structure")},
+        "per_structure": {s: int(len(g)) for s, g in pass_rows.groupby("Structure")},
     }
 
 
@@ -823,12 +894,14 @@ def main():
 
     total_rows = sum(s["n_rows"] for s in all_stats)
     total_nuc = sum(s["n_nuc"] for s in all_stats)
+    total_contrast_fail = sum(s["n_contrast_fail"] for s in all_stats)
 
     if all_stats:
         print("\n" + "=" * 40)
         print("OVERALL SUMMARY")
         print(f"  Experiments processed:     {len(all_stats)}")
         print(f"  Organelle feature rows:    {total_rows}")
+        print(f"  Contrast-fail channels:    {total_contrast_fail}")
         print(f"  Distinct nuclei measured:  {total_nuc}")
         print("=" * 40)
 
@@ -841,6 +914,7 @@ def main():
         summary={
             "experiments_processed": len(all_stats),
             "organelle_feature_rows": total_rows,
+            "contrast_fail_channels": total_contrast_fail,
             "nuclei_measured": total_nuc,
             "per_experiment": all_stats,
         },
