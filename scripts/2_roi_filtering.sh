@@ -2,9 +2,9 @@
 #SBATCH --job-name=indi_roi_filtering
 #SBATCH --output=/data/kelpschdj/iNDI/Production/outputs/logs/indi_roi_filtering_%j.out
 #SBATCH --error=/data/kelpschdj/iNDI/Production/outputs/logs/indi_roi_filtering_%j.err
-#SBATCH --time=01:00:00
+#SBATCH --time=00:30:00
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=32G
+#SBATCH --mem=8G
 #SBATCH --partition=norm
 
 cd /data/kelpschdj/iNDI/Production/scripts
