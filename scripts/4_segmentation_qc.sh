@@ -17,7 +17,7 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20260803_124616_6otz"
+RUN_ID="20260901_155524_uoe5"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
 SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
 

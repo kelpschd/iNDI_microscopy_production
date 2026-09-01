@@ -55,7 +55,7 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 #    so every task sees the same value:
 #
 #      export ORG_VERSION_STAMP=$(date +%Y%m%d_%H%M%S)
-#      RUN_ID="20260803_124616_6otz"
+#      RUN_ID="20260901_155524_uoe5"
 #      FILT="/data/kelpschdj/iNDI/Production/outputs/run_${RUN_ID}/nuclei_filtered"
 #      N=$(ls "$FILT"/*_nuclei_filtered*.parquet | wc -l)
 #      sbatch --export=ALL,ORG_VERSION_STAMP \
@@ -64,6 +64,6 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 # 2) After the array finishes, fold the per-experiment shards into the run
 #    metadata (run once, not in parallel):
 #
-#      python 3_organelle_segmentation.py --run-id 20260803_124616_6otz --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
+#      python 3_organelle_segmentation.py --run-id 20260901_155524_uoe5 --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
 #
 #############################################################################

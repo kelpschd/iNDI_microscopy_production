@@ -14,5 +14,5 @@ source /data/kelpschdj/conda/etc/profile.d/conda.sh
 conda activate indi_project
 
 python /data/kelpschdj/iNDI/Production/scripts/2_roi_filtering.py \
-    --run-id 20260803_124616_6otz \
+    --run-id 20260901_155524_uoe5 \
     --output-root /data/kelpschdj/iNDI/Production/outputs
