@@ -14,5 +14,5 @@ source /data/kelpschdj/conda/etc/profile.d/conda.sh
 conda activate indi_project
 
 python /data/kelpschdj/iNDI/Production/scripts/0_img_metadata.py \
-    "/data/CARDPB2/iNDI/Production/AbPanel1" \
+    "/data/CARDPB2/iNDI/Production/AbPanel2" \
     --output-root /data/kelpschdj/iNDI/Production/outputs

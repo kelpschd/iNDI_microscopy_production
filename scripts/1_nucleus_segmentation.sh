@@ -19,6 +19,6 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 python /data/kelpschdj/iNDI/Production/scripts/1_nucleus_segmentation.py \
-    --run-id 20260901_155524_uoe5 \
+    --run-id 20260921_131450_n3r6 \
     --output-root /data/kelpschdj/iNDI/Production/outputs \
     -s processes
