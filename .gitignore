@@ -26,6 +26,8 @@ logs/
 *.csv
 *.parquet
 *.png
+*.pptx
+
 # after repo clean up, consider removing these
 qc_figures/
 organelle_features/
