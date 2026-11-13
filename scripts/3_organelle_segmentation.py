@@ -19,7 +19,7 @@ from scipy.ndimage import (
 from skimage import filters, morphology
 from skimage.measure import label, regionprops_table
 from skimage.filters import threshold_triangle, threshold_otsu
-from skimage.morphology import remove_small_objects, erosion, dilation
+from skimage.morphology import remove_small_objects, erosion, dilation, remove_small_holes
 from skimage.morphology import disk as morph_disk
 
 # --- run_utils bootstrap ---------------------------------------------------
@@ -64,10 +64,17 @@ NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
 # --- Stain / structure design ---------------------------------------------
 
 ANTIGENS = {
-    "GM130": "Golgi", "LAMP1": "Lysosome", "G3BP1": "Stress granule",
-    "EEA1": "Endosome", "TOMM20": "Mitochondria", "TUBB3": "Microtubules",
-    "TGN46": "Golgi", "MAP2": "Microtubules", "TUJ1": "Microtubules",
-    "RAB11A": "Endosome", "DAPI": "Nuclei",
+    "GM130": "Golgi", 
+    "LAMP1": "Lysosome", 
+    "G3BP1": "Stress granule",
+    "EEA1": "Endosome", 
+    "TOMM20": "Mitochondria", 
+    "TUBB3": "Microtubules",
+    "TGN46": "Golgi", 
+    "MAP2": "Microtubules", 
+    "TUJ1": "Microtubules",
+    "RAB11A": "Recycling endosome", 
+    "DAPI": "Nuclei",
 }
 
 # Panel -> {Channel_name: Stain}
@@ -210,12 +217,40 @@ def process_mitochondria_mask(image, intensity_scaling_param=(3.5, 15), blur_sig
         combined = binary_fill_holes(combined)
     return remove_small_objects(combined, min_size=min_area, connectivity=1)
 
+####
+# add in segmentations for Rab11a and TUJ1
+def process_rab11a_mask(image, intensity_scaling_param=(3, 19), blur_sigma=1.0,
+                        log_params=((1.0, 0.03),), hole_max=81, min_area=3):
+    m, s = norm.fit(image.ravel())
+    stretch_min = max(m - intensity_scaling_param[0] * s, image.min())
+    stretch_max = min(m + intensity_scaling_param[1] * s, image.max())
+    image_norm = (np.clip(image, stretch_min, stretch_max) - stretch_min) / (stretch_max - stretch_min + 1e-12)
+    blurred = filters.gaussian(image_norm, sigma=blur_sigma)
+    log_mask = np.logical_or.reduce([(-1.0 * sig ** 2 * gaussian_laplace(blurred, sigma=sig)) > cut for sig, cut in log_params])
+    if hole_max and hole_max > 0:
+        log_mask = remove_small_holes(log_mask, area_threshold=hole_max, connectivity=1)
+    return remove_small_objects(log_mask, min_size=min_area, connectivity=1)
+ 
+ 
+def process_tubulin_mask(image, intensity_scaling_param=(1.5, 8.0), blur_sigma=1.0,
+                         vesselness_sigmas=(1.0,), vesselness_cutoff=0.05,
+                         black_ridges=False, min_area=20):
+    m, s = norm.fit(image.ravel())
+    stretch_min = max(m - intensity_scaling_param[0] * s, image.min())
+    stretch_max = min(m + intensity_scaling_param[1] * s, image.max())
+    image_norm = (np.clip(image, stretch_min, stretch_max) - stretch_min) / (stretch_max - stretch_min + 1e-12)
+    blurred = filters.gaussian(image_norm, sigma=blur_sigma)
+    vessel_mask = filters.frangi(blurred, sigmas=vesselness_sigmas, black_ridges=black_ridges) > vesselness_cutoff
+    return remove_small_objects(vessel_mask, min_size=min_area, connectivity=1)
+
 
 SEGMENTERS_BY_STRUCTURE = {
     "Golgi": process_golgi_mask,
     "Lysosome": process_lysosome_mask,
     "Endosome": process_endosome_mask,
     "Mitochondria": process_mitochondria_mask,
+    "Recycling endosome": process_rab11a_mask,
+    "Microtubules": process_tubulin_mask,
 }
 
 
