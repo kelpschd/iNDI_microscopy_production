@@ -5,12 +5,14 @@
 # --- Editors / IDEs ---
 .vscode/
 .ipynb_checkpoints/
+.smbdelete*
 
 # --- R ---
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+._.Rhistory
 
 # --- Python ---
 __pycache__/
@@ -36,6 +38,7 @@ Nucleus_segmentation/analysis/
 
 # --- Misc ---
 bioinf_meetup_demo.ipynb
+*.md
 
 # --- Pipeline run outputs ---
 outputs/
