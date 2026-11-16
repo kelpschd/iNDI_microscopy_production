@@ -1,6 +1,7 @@
 # --- OS ---
 .DS_Store
 ._.*
+._*
 
 # --- Editors / IDEs ---
 .vscode/
@@ -37,7 +38,7 @@ Nucleus_segmentation/analysis/
 
 # --- Misc ---
 bioinf_meetup_demo.ipynb
-*.md
+batch_correction_plan.md
 
 # --- Pipeline run outputs ---
 outputs/
