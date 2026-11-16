@@ -5,7 +5,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=48G
-#SBATCH --gres=lscratch:500
+#SBATCH --gres=lscratch:1000
 #SBATCH --partition=norm
 
 cd /data/kelpschdj/iNDI/Production/scripts
@@ -17,18 +17,24 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20260901_155524_uoe5"
+RUN_ID="20260921_131450_n3r6"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
 
 # Discover experiments from THIS RUN's filtered parquets (new names, no date).
-FILT_DIR="${OUTPUT_ROOT}/run_${RUN_ID}/nuclei_filtered"
-mapfile -t EXPERIMENTS < <(
-    for f in "$FILT_DIR"/*_nuclei_filtered*.parquet; do
-        [ -e "$f" ] || continue
-        base=$(basename "$f")
-        echo "${base%%_nuclei_filtered*}"
-    done | sort -u
+# FILT_DIR="${OUTPUT_ROOT}/run_${RUN_ID}/nuclei_filtered"
+# mapfile -t EXPERIMENTS < <(
+#     for f in "$FILT_DIR"/*_nuclei_filtered*.parquet; do
+#         [ -e "$f" ] || continue
+#         base=$(basename "$f")
+#         echo "${base%%_nuclei_filtered*}"
+#     done | sort -u
+# )
+
+EXPERIMENTS=(
+    48fb9a14-1123-488d-9b56-3befe944f933
+    a9b2a502-ad2f-4ee9-85ba-10df3cea3b46
+    cd5eb985-d862-4c96-8b57-570f462ee2fa
 )
 
 EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
@@ -40,10 +46,10 @@ fi
 echo "Array task $SLURM_ARRAY_TASK_ID -> experiment: $EXP"
 echo "lscratch: /lscratch/$SLURM_JOB_ID"
 
-python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
+/vf/users/kelpschdj/conda/envs/indi_project/bin/python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
-    --panel 1 \
+    --panel 2 \
     --src-base "$SRC_BASE" \
     --version-stamp "$ORG_VERSION_STAMP" \
     -e "$EXP"
@@ -55,11 +61,10 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 #    so every task sees the same value:
 #
 #      export ORG_VERSION_STAMP=$(date +%Y%m%d_%H%M%S)
-#      RUN_ID="20260901_155524_uoe5"
+#      RUN_ID="20260921_131450_n3r6"
 #      FILT="/data/kelpschdj/iNDI/Production/outputs/run_${RUN_ID}/nuclei_filtered"
 #      N=$(ls "$FILT"/*_nuclei_filtered*.parquet | wc -l)
-#      sbatch --export=ALL,ORG_VERSION_STAMP \
-#             --array=0-$((N-1))%4 3_organelle_segmentation.sh
+#      sbatch --export=ALL,ORG_VERSION_STAMP --array=0-$((N-1))%4 3_organelle_segmentation.sh
 #
 # 2) After the array finishes, fold the per-experiment shards into the run
 #    metadata (run once, not in parallel):
