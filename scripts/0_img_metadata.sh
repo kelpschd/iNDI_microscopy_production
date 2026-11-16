@@ -9,9 +9,11 @@
 
 cd /data/kelpschdj/iNDI/Production/scripts
 
-# Load environment
-source /data/kelpschdj/conda/etc/profile.d/conda.sh
+# Load environment (deactivate anything inherited from the submitting shell first)
+source /vf/users/kelpschdj/conda/etc/profile.d/conda.sh
+while [ "${CONDA_SHLVL:-0}" -gt 0 ]; do conda deactivate; done
 conda activate indi_project
+which python
 
 python /data/kelpschdj/iNDI/Production/scripts/0_img_metadata.py \
     "/data/CARDPB2/iNDI/Production/AbPanel2" \

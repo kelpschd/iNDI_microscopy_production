@@ -10,31 +10,28 @@
 
 cd /data/kelpschdj/iNDI/Production/scripts
 
-source /data/kelpschdj/conda/etc/profile.d/conda.sh
+# Load environment (deactivate anything inherited from the submitting shell first)
+source /vf/users/kelpschdj/conda/etc/profile.d/conda.sh
+while [ "${CONDA_SHLVL:-0}" -gt 0 ]; do conda deactivate; done
 conda activate indi_project
+which python
 
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20260921_131450_n3r6"
+RUN_ID="20261116_164909_nu3h"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
 
 # Discover experiments from THIS RUN's filtered parquets (new names, no date).
-# FILT_DIR="${OUTPUT_ROOT}/run_${RUN_ID}/nuclei_filtered"
-# mapfile -t EXPERIMENTS < <(
-#     for f in "$FILT_DIR"/*_nuclei_filtered*.parquet; do
-#         [ -e "$f" ] || continue
-#         base=$(basename "$f")
-#         echo "${base%%_nuclei_filtered*}"
-#     done | sort -u
-# )
-
-EXPERIMENTS=(
-    48fb9a14-1123-488d-9b56-3befe944f933
-    a9b2a502-ad2f-4ee9-85ba-10df3cea3b46
-    cd5eb985-d862-4c96-8b57-570f462ee2fa
+FILT_DIR="${OUTPUT_ROOT}/run_${RUN_ID}/nuclei_filtered"
+mapfile -t EXPERIMENTS < <(
+    for f in "$FILT_DIR"/*_nuclei_filtered*.parquet; do
+        [ -e "$f" ] || continue
+        base=$(basename "$f")
+        echo "${base%%_nuclei_filtered*}"
+    done | sort -u
 )
 
 EXP=${EXPERIMENTS[$SLURM_ARRAY_TASK_ID]}
@@ -46,10 +43,10 @@ fi
 echo "Array task $SLURM_ARRAY_TASK_ID -> experiment: $EXP"
 echo "lscratch: /lscratch/$SLURM_JOB_ID"
 
-/vf/users/kelpschdj/conda/envs/indi_project/bin/python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
+python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
-    --panel 2 \
+    --panel 1 \
     --src-base "$SRC_BASE" \
     --version-stamp "$ORG_VERSION_STAMP" \
     -e "$EXP"
@@ -61,7 +58,7 @@ echo "lscratch: /lscratch/$SLURM_JOB_ID"
 #    so every task sees the same value:
 #
 #      export ORG_VERSION_STAMP=$(date +%Y%m%d_%H%M%S)
-#      RUN_ID="20260921_131450_n3r6"
+#      RUN_ID="20261116_164909_nu3h"
 #      FILT="/data/kelpschdj/iNDI/Production/outputs/run_${RUN_ID}/nuclei_filtered"
 #      N=$(ls "$FILT"/*_nuclei_filtered*.parquet | wc -l)
 #      sbatch --export=ALL,ORG_VERSION_STAMP --array=0-$((N-1))%4 3_organelle_segmentation.sh
@@ -70,6 +67,6 @@ echo "lscratch: /lscratch/$SLURM_JOB_ID"
 #    metadata (run once, not in parallel):
 #    Don't forget to activate the env
 #
-#      python 3_organelle_segmentation.py --run-id 20260921_131450_n3r6 --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
+#      python 3_organelle_segmentation.py --run-id 20261116_164909_nu3h --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
 #
 #############################################################################

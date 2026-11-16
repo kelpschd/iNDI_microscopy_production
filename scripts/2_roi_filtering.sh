@@ -9,10 +9,12 @@
 
 cd /data/kelpschdj/iNDI/Production/scripts
 
-# Load environment
-source /data/kelpschdj/conda/etc/profile.d/conda.sh
+# Load environment (deactivate anything inherited from the submitting shell first)
+source /vf/users/kelpschdj/conda/etc/profile.d/conda.sh
+while [ "${CONDA_SHLVL:-0}" -gt 0 ]; do conda deactivate; done
 conda activate indi_project
+which python
 
 python /data/kelpschdj/iNDI/Production/scripts/2_roi_filtering.py \
-    --run-id 20260921_131450_n3r6 \
+    --run-id 20261116_164909_nu3h \
     --output-root /data/kelpschdj/iNDI/Production/outputs
