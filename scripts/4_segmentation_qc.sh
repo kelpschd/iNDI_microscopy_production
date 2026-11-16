@@ -17,13 +17,13 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20260901_155524_uoe5"
+RUN_ID="20260921_131450_n3r6"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
 
-python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
+/vf/users/kelpschdj/conda/envs/indi_project/bin/python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
     -b "$SRC_BASE" \
-    -p 1 \
+    -p 2 \
     -n 5

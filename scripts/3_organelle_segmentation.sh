@@ -70,6 +70,6 @@ echo "lscratch: /lscratch/$SLURM_JOB_ID"
 #    metadata (run once, not in parallel):
 #    Don't forget to activate the env
 #
-#      python 3_organelle_segmentation.py --run-id 20260901_155524_uoe5 --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
+#      python 3_organelle_segmentation.py --run-id 20260921_131450_n3r6 --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
 #
 #############################################################################
