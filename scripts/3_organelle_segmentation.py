@@ -15,7 +15,9 @@ import tifffile
 from scipy.stats import norm
 from scipy.ndimage import (
     distance_transform_edt, gaussian_laplace, binary_fill_holes,
+    binary_dilation,
 )
+from scipy.spatial import cKDTree
 from skimage import filters, morphology
 from skimage.measure import label, regionprops_table
 from skimage.filters import threshold_triangle, threshold_otsu
@@ -36,6 +38,11 @@ except ImportError:
 
 # ROI geometry (must match the ROI definition used in 2_roi_filtering.py)
 ROI_RADIUS = 120
+
+# How segmented pixels are assigned to nuclei/ROIs. Recorded in run metadata.
+#   clip_nearest_nucleus: each mask pixel goes to its nearest nucleus if within
+#   ROI_RADIUS; objects crossing the ROI boundary are trimmed, not dropped.
+ROI_ASSIGNMENT = "clip_nearest_nucleus"
 
 # Only nuclei that passed all upstream filters are used as ROI centers.
 SELECTED_ONLY = True
@@ -64,16 +71,16 @@ NS = {"h": "43B2A954-E3C3-47E1-B392-6635266B0DD3/HarmonyV7"}
 # --- Stain / structure design ---------------------------------------------
 
 ANTIGENS = {
-    "GM130": "Golgi", 
-    "LAMP1": "Lysosome", 
+    "GM130": "Golgi",
+    "LAMP1": "Lysosome",
     "G3BP1": "Stress granule",
-    "EEA1": "Endosome", 
-    "TOMM20": "Mitochondria", 
+    "EEA1": "Endosome",
+    "TOMM20": "Mitochondria",
     "TUBB3": "Microtubules",
-    "TGN46": "Golgi", 
-    "MAP2": "Microtubules", 
+    "TGN46": "Golgi",
+    "MAP2": "Microtubules",
     "TUJ1": "Microtubules",
-    "RAB11A": "Recycling endosome", 
+    "RAB11A": "Recycling endosome",
     "DAPI": "Nuclei",
 }
 
@@ -133,6 +140,7 @@ def collect_params():
     """
     return {
         "roi_radius": ROI_RADIUS,
+        "roi_assignment": ROI_ASSIGNMENT,
         "selected_only": SELECTED_ONLY,
         "segmenters": sorted(SEGMENTERS_BY_STRUCTURE.keys()),
         "panel_design": PANEL_DESIGN,
@@ -230,8 +238,8 @@ def process_rab11a_mask(image, intensity_scaling_param=(3, 19), blur_sigma=1.0,
     if hole_max and hole_max > 0:
         log_mask = remove_small_holes(log_mask, area_threshold=hole_max, connectivity=1)
     return remove_small_objects(log_mask, min_size=min_area, connectivity=1)
- 
- 
+
+
 def process_tubulin_mask(image, intensity_scaling_param=(1.5, 8.0), blur_sigma=1.0,
                          vesselness_sigmas=(1.0,), vesselness_cutoff=0.05,
                          black_ridges=False, min_area=20):
@@ -336,56 +344,25 @@ def build_samplesheet(experiment_path, panel):
 
 # --- Whole-frame segmentation + ROI assignment ----------------------------
 
-def assign_objects_to_rois(obj_labels, centroids_yx, radius):
-    """Assign each labeled object to an ROI under full-containment rules.
+def build_roi_owner_map(mask, centroids_yx, radius):
+    """Label every mask pixel with the (1-based) index of the nucleus that owns it.
 
-    An object is kept only if ALL of its pixels lie inside a single ROI circle.
-    Objects touching or crossing an ROI boundary are dropped. Where an object
-    is fully contained in more than one (overlapping) ROI, it goes to the
-    nearest nucleus centroid.
+    A mask pixel is owned by its NEAREST nucleus centroid, provided that
+    centroid is within `radius`. Pixels farther than `radius` from every
+    nucleus get 0 (dropped). Nearest-nucleus ownership means overlapping ROIs
+    never double-count a pixel.
 
-    Parameters
-    ----------
-    obj_labels : 2D int array
-        Connected-component labels of the whole-frame organelle mask.
-    centroids_yx : (N, 2) float array
-        Nucleus centroids (row, col) that define ROI centers.
-    radius : float
-        ROI radius in pixels.
-
-    Returns
-    -------
-    dict[int, int]
-        Maps object label -> index into centroids_yx (the assigned ROI).
-        Objects not assignable are absent from the dict.
+    Returns an int32 array shaped like `mask`; value k > 0 means the pixel
+    belongs to centroids_yx[k - 1].
     """
-    assignment = {}
-    if len(centroids_yx) == 0:
-        return assignment
-
-    props = regionprops_table(obj_labels, properties=("label", "coords", "centroid"))
-    r2 = radius * radius
-
-    for lab, coords, cy, cx in zip(
-        props["label"], props["coords"],
-        props["centroid-0"], props["centroid-1"],
-    ):
-        # distance^2 from every ROI center to this object's own centroid,
-        # used only to order candidate ROIs (nearest first for tie-break).
-        d2_centers = ((centroids_yx[:, 0] - cy) ** 2
-                      + (centroids_yx[:, 1] - cx) ** 2)
-        order = np.argsort(d2_centers)
-
-        obj_y = coords[:, 0]
-        obj_x = coords[:, 1]
-        for roi_idx in order:
-            ry, rx = centroids_yx[roi_idx]
-            # full containment: the object's farthest pixel must be inside.
-            max_d2 = np.max((obj_y - ry) ** 2 + (obj_x - rx) ** 2)
-            if max_d2 <= r2:
-                assignment[int(lab)] = int(roi_idx)
-                break  # nearest qualifying ROI wins
-    return assignment
+    owner = np.zeros(mask.shape, dtype=np.int32)
+    coords = np.argwhere(mask)
+    if coords.size == 0 or len(centroids_yx) == 0:
+        return owner
+    dist, nearest = cKDTree(centroids_yx).query(coords, k=1)
+    inside = dist <= radius
+    owner[coords[inside, 0], coords[inside, 1]] = nearest[inside] + 1
+    return owner
 
 
 # --- Per-ROI feature helpers ----------------------------------------------
@@ -442,18 +419,23 @@ def _contrast_fail_row(structure, frame_std, site_meta, row):
 
 def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
                               nucleus_ids, radius, site_meta, row):
-    """Segment one channel across the whole frame, assign objects to ROIs,
-    and return per-nucleus organelle feature rows.
+    """Segment one channel across the whole frame, clip the mask to each
+    nucleus's ROI, and return per-nucleus organelle feature rows.
+
+    ROI rule (clip, not drop): every mask pixel is assigned to its nearest
+    nucleus if within `radius`; pixels outside every ROI are discarded.
+    Objects crossing an ROI boundary are TRIMMED, not removed. Each nucleus's
+    clipped mask is relabeled and all features (pooled-pixel and per-object)
+    are computed from it. Because trimmed objects have artificial cut edges,
+    `n_truncated_objects` and `truncated_area_fraction` report how much of the
+    ROI's organelle area belongs to objects cut by the ROI/territory boundary,
+    so shape/count features can be filtered or interpreted accordingly.
 
     A per-stain full-frame contrast gate runs first: channels whose raw-frame
     std falls below their cutoff are not segmented, and a single marker row is
     returned so the failure is recorded (distinct from a channel that
     segmented fine but found no organelles). Passing rows record `frame_std`
     and `contrast_check == "pass"` so cutoffs can be tuned empirically.
-
-    Per-object shape/intensity and radial distance are summarized across each
-    ROI's objects; texture and granularity are computed once per ROI over its
-    assigned-object region.
     """
     # --- Contrast gate (per stain) ---
     frame_std = float(ch_img.astype(np.float64).std())
@@ -462,51 +444,63 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
     if frame_std < cutoff:
         return [_contrast_fail_row(structure, frame_std, site_meta, row)]
 
-    mask = seg_fn(ch_img)
-    obj_labels = label(mask, connectivity=1)
-    if obj_labels.max() == 0:
+    mask = np.asarray(seg_fn(ch_img), dtype=bool)
+    owner = build_roi_owner_map(mask, centroids_yx, radius)
+    if not owner.any():
         return []
 
-    assignment = assign_objects_to_rois(obj_labels, centroids_yx, radius)
-    if not assignment:
-        return []
-
-    # Group object labels by assigned ROI index.
-    by_roi = {}
-    for obj_lab, roi_idx in assignment.items():
-        by_roi.setdefault(roi_idx, []).append(obj_lab)
-
-    # One per-object table for the whole frame; filtered per ROI below.
-    # Object identity is preserved exactly as assign_objects_to_rois decided.
-    prop_table = regionprops_table(
-        obj_labels,
-        intensity_image=ch_img,
-        properties=("label", "centroid") + SHAPE_PROPS + INTENSITY_PROPS,
-    )
-    table_labels = np.asarray(prop_table["label"])
+    H, W = mask.shape
+    present = np.unique(owner)
+    present = present[present > 0] - 1          # 0-based ROI indices with signal
 
     rows = []
-    for roi_idx, obj_labs in by_roi.items():
-        keep_mask = np.isin(table_labels, obj_labs)
+    for roi_idx in present:
+        ry, rx = centroids_yx[roi_idx]
+        y0 = max(0, int(np.floor(ry - radius)))
+        y1 = min(H, int(np.ceil(ry + radius)) + 1)
+        x0 = max(0, int(np.floor(rx - radius)))
+        x1 = min(W, int(np.ceil(rx + radius)) + 1)
 
-        roi_mask = np.isin(obj_labels, obj_labs)
-        vals = ch_img[roi_mask]           # pooled-pixel intensity (kept as-is)
-        area_px = int(roi_mask.sum())     # total organelle area in ROI
-        count_obj = len(obj_labs)
+        crop_img = ch_img[y0:y1, x0:x1]
+        crop_roi = owner[y0:y1, x0:x1] == (roi_idx + 1)   # this ROI's clipped mask
+        crop_full = mask[y0:y1, x0:x1]                    # unclipped mask, same window
 
-        # Pooled-pixel intensity summary (unchanged behavior).
-        if vals.size:
-            int_max = float(vals.max())
-            int_sum = float(vals.sum())
-            int_mean = float(vals.mean())
-            int_median = float(np.median(vals))
-            int_std = float(vals.std())
-        else:
-            int_max = int_sum = 0.0
-            int_mean = int_median = int_std = np.nan
-        int_cv = (int_std / int_mean) if (not np.isnan(int_mean) and int_mean != 0) else np.nan
+        obj_labels = label(crop_roi, connectivity=1)
+        count_obj = int(obj_labels.max())
+        if count_obj == 0:
+            continue
 
-        # Per-object shape + intensity, summarized across this ROI's objects.
+        vals = crop_img[crop_roi]
+        area_px = int(crop_roi.sum())
+
+        # Truncation: retained pixels that touch mask pixels which were removed
+        # (outside the ROI circle, or owned by a closer nucleus).
+        removed = crop_full & ~crop_roi
+        cut_contact = binary_dilation(removed) & crop_roi
+        cut_labels = np.unique(obj_labels[cut_contact])
+        cut_labels = cut_labels[cut_labels > 0]
+        n_truncated = int(cut_labels.size)
+        truncated_area = int(np.isin(obj_labels, cut_labels).sum()) if n_truncated else 0
+
+        # Pooled-pixel intensity summary.
+        int_max = float(vals.max())
+        int_sum = float(vals.sum())
+        int_mean = float(vals.mean())
+        int_median = float(np.median(vals))
+        int_std = float(vals.std())
+        int_cv = (int_std / int_mean) if int_mean != 0 else np.nan
+
+        # Per-object shape + intensity from the clipped objects.
+        prop_table = regionprops_table(
+            obj_labels,
+            intensity_image=crop_img,
+            properties=("label", "centroid") + SHAPE_PROPS + INTENSITY_PROPS,
+        )
+        # Crop coordinates -> full-frame coordinates (for radial distance).
+        prop_table["centroid-0"] = np.asarray(prop_table["centroid-0"], dtype=float) + y0
+        prop_table["centroid-1"] = np.asarray(prop_table["centroid-1"], dtype=float) + x0
+        keep_mask = np.ones(count_obj, dtype=bool)
+
         shape_summary = _summarize_props(
             prop_table, keep_mask, SHAPE_PROPS + INTENSITY_PROPS
         )
@@ -538,11 +532,14 @@ def segment_frame_and_measure(structure, ch_img, seg_fn, centroids_yx,
             # contrast QC (frame-level; same value for every row from this frame)
             "frame_std": frame_std,
             "contrast_check": "pass",
-            # ROI-level (count-level) metrics
+            # ROI-level (count-level) metrics, from the clipped mask
             "area_px": area_px,
             "organelle_count": count_obj,
-            "average_organelle_area": (area_px / count_obj) if count_obj else 0.0,
+            "average_organelle_area": area_px / count_obj,
             "roi_occupancy": area_px / (np.pi * radius ** 2),
+            # clipping QC: objects cut by the ROI / nearest-nucleus boundary
+            "n_truncated_objects": n_truncated,
+            "truncated_area_fraction": truncated_area / area_px,
             # pooled-pixel intensity (existing columns, kept for continuity)
             "max_f_intensity": int_max,
             "sum_f_intensity": int_sum,
