@@ -11,7 +11,6 @@ import matplotlib
 matplotlib.use("Agg")  # headless: write PNGs, no display
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
-from skimage.measure import label
 
 # --- run_utils bootstrap ---------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,7 +20,7 @@ import run_utils as ru  # noqa: E402
 # pipeline. These come straight from script 3.
 _seg = import_module("3_organelle_segmentation")
 SEGMENTERS_BY_STRUCTURE = _seg.SEGMENTERS_BY_STRUCTURE
-assign_objects_to_rois = _seg.assign_objects_to_rois
+build_roi_owner_map = _seg.build_roi_owner_map
 build_samplesheet = _seg.build_samplesheet
 # Same per-stain contrast gate as script 3, so QC skips exactly the channels
 # the pipeline would skip.
@@ -83,9 +82,10 @@ def qc_show_three_panel(nuc_img, ch_img, global_seg, xs, ys, r,
 def qc_tile_gallery(tiles, seg_tiles, centers_local, radius, title_prefix,
                     out_path, max_tiles=8):
     """A row of per-ROI tiles with the ASSIGNED segmentation overlaid and the
-    ROI circle drawn. seg_tiles contain only objects assigned to that ROI
-    (full-containment), matching script 3. centers_local gives the circle
-    center within each tile's local coordinates."""
+    ROI circle drawn. seg_tiles contain only the pixels owned by that ROI
+    (clip rule: objects are trimmed at the ROI boundary, not dropped),
+    matching script 3. centers_local gives the circle center within each
+    tile's local coordinates."""
     if max_tiles <= 0 or len(tiles) == 0:
         return
     n = min(max_tiles, len(tiles))
@@ -121,9 +121,11 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
     whose raw-frame std falls below their cutoff are skipped entirely, so QC
     never renders a mask for a channel the pipeline would have dropped.
 
-    The mask shown is the whole-frame segmentation (the current pipeline
-    behavior); tiles are crops of that mask around each ROI, so the gallery
-    reflects what actually gets assigned rather than per-tile re-segmentation.
+    The mask shown is the whole-frame segmentation clipped to ROIs with the
+    same owner-map rule as script 3 (each mask pixel goes to the nearest
+    nucleus within the ROI radius; objects are trimmed, not dropped). Tiles
+    are crops of the owner map around each ROI, so the gallery reflects what
+    actually gets assigned rather than per-tile re-segmentation.
     """
     site_df = site_df.copy()
     for c in ("Stain", "Structure", "filename"):
@@ -158,22 +160,26 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
             continue
 
         # whole-frame segmentation (current pipeline behavior)
-        global_seg = seg_fn(ch_img)
+        global_seg = np.asarray(seg_fn(ch_img)).astype(bool)
 
-        # run the REAL assignment: which objects belong to which ROI under
-        # full-containment + nearest-centroid (identical to script 3).
-        obj_labels = label(global_seg, connectivity=1)
-        assignment = assign_objects_to_rois(obj_labels, centroids_yx, radius)
+        # run the REAL assignment (clip rule, identical to script 3): every
+        # mask pixel goes to the nearest nucleus within `radius`; objects are
+        # trimmed at the ROI boundary rather than dropped.
+        owner = np.asarray(build_roi_owner_map(global_seg, centroids_yx, radius))
+        assert owner.shape == global_seg.shape, \
+            f"owner map shape {owner.shape} != mask shape {global_seg.shape}"
+        assert owner.min() >= -1 and owner.max() < len(centroids_yx), (
+            f"unexpected owner values [{owner.min()}, {owner.max()}] for "
+            f"{len(centroids_yx)} ROIs; check build_roi_owner_map conventions")
+        owner = np.where(global_seg, owner, -1)   # only segmented pixels count
 
-        # group assigned object labels by ROI index
-        by_roi = {}
-        for obj_lab, roi_idx in assignment.items():
-            by_roi.setdefault(roi_idx, []).append(obj_lab)
+        # assigned pixel count per ROI index (used to rank tiles)
+        roi_ids, roi_areas = np.unique(owner[owner >= 0], return_counts=True)
+        by_roi = dict(zip(roi_ids.tolist(), roi_areas.tolist()))
 
         # the overlay panel shows only the ASSIGNED mask (what the pipeline
         # actually measures), not every segmented pixel.
-        assigned_seg = np.isin(obj_labels, list(assignment.keys())) if assignment \
-            else np.zeros_like(global_seg, dtype=bool)
+        assigned_seg = owner >= 0
 
         title = f"{structure} | {frame_name}"
         safe_frame = frame_name.replace("/", "_")
@@ -184,10 +190,10 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
                             title_prefix=title, out_path=panel_path)
         written += 1
 
-        # --- tile gallery: each tile shows only that ROI's assigned objects ---
+        # --- tile gallery: each tile shows only that ROI's owned pixels ---
         example_tiles, example_segs, centers_local = [], [], []
-        # prefer ROIs that actually have assigned objects, so tiles are useful
-        ranked = sorted(by_roi, key=lambda k: len(by_roi[k]), reverse=True)
+        # prefer ROIs that actually have assigned pixels, so tiles are useful
+        ranked = sorted(by_roi, key=lambda k: by_roi[k], reverse=True)
         if not ranked:
             ranked = list(range(len(centroids_yx)))
         for roi_idx in ranked:
@@ -196,11 +202,8 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
             cy, cx = centroids_yx[roi_idx]
             y0, y1, x0, x1 = bbox_from_center(cy, cx, radius, H, W)
             example_tiles.append(ch_img[y0:y1, x0:x1])
-            # only this ROI's assigned objects, cropped to the tile
-            roi_labs = by_roi.get(roi_idx, [])
-            roi_mask = np.isin(obj_labels, roi_labs) if roi_labs \
-                else np.zeros_like(obj_labels, dtype=bool)
-            example_segs.append(roi_mask[y0:y1, x0:x1])
+            # only the pixels owned by this ROI, cropped to the tile
+            example_segs.append(owner[y0:y1, x0:x1] == roi_idx)
             centers_local.append((cy - y0, cx - x0))
 
         gallery_path = out_dir / f"{safe_frame}__{structure}__tiles.png"
