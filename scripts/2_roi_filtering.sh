@@ -16,5 +16,5 @@ conda activate indi_project
 which python
 
 python /data/kelpschdj/iNDI/Production/scripts/2_roi_filtering.py \
-    --run-id 20261116_164909_nu3h \
+    --run-id 20261116_165635_xanf \
     --output-root /data/kelpschdj/iNDI/Production/outputs

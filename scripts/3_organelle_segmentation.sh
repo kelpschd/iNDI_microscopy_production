@@ -20,9 +20,9 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20261116_164909_nu3h"
+RUN_ID="20261116_165635_xanf"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
 
 # Discover experiments from THIS RUN's filtered parquets (new names, no date).
 FILT_DIR="${OUTPUT_ROOT}/run_${RUN_ID}/nuclei_filtered"
@@ -46,7 +46,7 @@ echo "lscratch: /lscratch/$SLURM_JOB_ID"
 python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
-    --panel 1 \
+    --panel 2 \
     --src-base "$SRC_BASE" \
     --version-stamp "$ORG_VERSION_STAMP" \
     -e "$EXP"
@@ -58,7 +58,7 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 #    so every task sees the same value:
 #
 #      export ORG_VERSION_STAMP=$(date +%Y%m%d_%H%M%S)
-#      RUN_ID="20261116_164909_nu3h"
+#      RUN_ID="20261116_165635_xanf"
 #      FILT="/data/kelpschdj/iNDI/Production/outputs/run_${RUN_ID}/nuclei_filtered"
 #      N=$(ls "$FILT"/*_nuclei_filtered*.parquet | wc -l)
 #      sbatch --export=ALL,ORG_VERSION_STAMP --array=0-$((N-1))%4 3_organelle_segmentation.sh
@@ -67,6 +67,6 @@ python /data/kelpschdj/iNDI/Production/scripts/3_organelle_segmentation.py \
 #    metadata (run once, not in parallel):
 #    Don't forget to activate the env
 #
-#      python 3_organelle_segmentation.py --run-id 20261116_164909_nu3h --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
+#      python 3_organelle_segmentation.py --run-id 20261116_165635_xanf --output-root /data/kelpschdj/iNDI/Production/outputs --merge-only
 #
 #############################################################################

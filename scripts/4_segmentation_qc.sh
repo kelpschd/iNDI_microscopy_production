@@ -9,21 +9,24 @@
 
 cd /data/kelpschdj/iNDI/Production/scripts
 
-source /data/kelpschdj/conda/etc/profile.d/conda.sh
+# Load environment (deactivate anything inherited from the submitting shell first)
+source /vf/users/kelpschdj/conda/etc/profile.d/conda.sh
+while [ "${CONDA_SHLVL:-0}" -gt 0 ]; do conda deactivate; done
 conda activate indi_project
+which python
 
 # Keep BLAS single-threaded (segmenters call into scipy/skimage).
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20260921_131450_n3r6"
+RUN_ID="20261116_164909_nu3h"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
 
-/vf/users/kelpschdj/conda/envs/indi_project/bin/python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
+python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
     -b "$SRC_BASE" \
-    -p 2 \
+    -p 1 \
     -n 5
