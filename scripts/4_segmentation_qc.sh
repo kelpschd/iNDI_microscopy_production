@@ -20,13 +20,13 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-RUN_ID="20261116_164909_nu3h"
+RUN_ID="20261116_165635_xanf"
 OUTPUT_ROOT="/data/kelpschdj/iNDI/Production/outputs"
-SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel1"
+SRC_BASE="/data/CARDPB2/iNDI/Production/AbPanel2"
 
 python -u /data/kelpschdj/iNDI/Production/scripts/4_segmentation_qc.py \
     --run-id "$RUN_ID" \
     --output-root "$OUTPUT_ROOT" \
     -b "$SRC_BASE" \
-    -p 1 \
+    -p 2 \
     -n 5

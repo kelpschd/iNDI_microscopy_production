@@ -165,7 +165,9 @@ def qc_one_frame(frame_name, site_df, nuc_grp, dapi_img, radius, out_dir):
         # run the REAL assignment (clip rule, identical to script 3): every
         # mask pixel goes to the nearest nucleus within `radius`; objects are
         # trimmed at the ROI boundary rather than dropped.
-        owner = np.asarray(build_roi_owner_map(global_seg, centroids_yx, radius))
+        # build_roi_owner_map is 1-based: 0 = unowned, k = nucleus k-1. Shift to
+        # 0-based indices with -1 = unowned, matching centroids_yx row order.
+        owner = np.asarray(build_roi_owner_map(global_seg, centroids_yx, radius)).astype(np.int64) - 1
         assert owner.shape == global_seg.shape, \
             f"owner map shape {owner.shape} != mask shape {global_seg.shape}"
         assert owner.min() >= -1 and owner.max() < len(centroids_yx), (
